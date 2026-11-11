@@ -31,6 +31,7 @@ export const Config = Schema.object({
     keyFile: Schema.string().required().description('This identity\'s Buzz secret key file, mode 0600'),
     provider: Schema.string().required().description('dsh provider id, as in the model picker settings'),
     model: Schema.string().required().description('dsh model id of that provider'),
+    cwd: Schema.string().default('').description('Working directory for new conversations with this identity. Overrides the shared cwd; use a separate directory per agent'),
     instructions: Schema.string().default('').description('Text put before every message to this identity, e.g. "Pass the message to subagent_codex unchanged and reply with its answer."'),
   })).default([]).description('dsh models that live in Buzz as their own users. Mention one, DM it, or reply in its thread: it answers at once'),
 })
@@ -133,7 +134,7 @@ export async function apply(ctx, config = {}) {
     if (!secretHex) continue
     const conn = listen({
       name: a.name, relayUrl, secretHex, allowFrom, allowAgents, maxAgentReplies,
-      answer: makeAnswerer(ctx, { ...a, cwd }, deps),
+      answer: makeAnswerer(ctx, { ...a, cwd: a.cwd || cwd }, deps),
       send: makeSender({ relayUrl, keyFile: a.keyFile, cli }),
       store: threadStore(a.keyFile),
       log: (o) => say(JSON.stringify(o)),

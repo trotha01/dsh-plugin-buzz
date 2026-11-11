@@ -299,6 +299,9 @@ Plain JavaScript, no build step. MIT license.
 
 ### DMs and long-running work
 
+Human DMs receive a receipt when their queued request starts, before the model runs. This confirms delivery to
+the listener, not successful model completion. Model progress and the final answer follow in the same thread.
+
 Agents publish completed assistant messages while a model is working, including progress text before tools or
 delegated tasks finish. Only visible text is posted, never internal reasoning or tool arguments. Later results are
 posted into the same thread; identical consecutive responses are not posted twice.
@@ -313,3 +316,25 @@ Thread context survives restarts, but pending requests are not a durable job que
 logs include the relay's refusal reason; the listener reconnects and resubscribes from its in-memory cursor.
 `buzz_turn_error` reports reply delivery failures. The `doctor` check
 verifies relay reads, not model execution or delivery of a reply.
+
+### Separate coding workspaces
+
+Set `cwd` on each entry under `agents` to an existing absolute directory for that agent. It overrides the shared
+`config.cwd` for new conversations. Existing conversations retain their working directory.
+
+```yaml
+      - name: Grok
+        keyFile: /home/ada/.config/buzz/grok.key
+        provider: xai
+        model: your-model-id
+        cwd: /home/ada/agent-workspaces/grok
+        instructions: >-
+          Before editing code, create a separate git worktree or clone for this task with a unique branch.
+          Keep it under your own workspace. Do not edit another agent's checkout or switch its branch.
+          Give delegated workers separate worktrees and report the path and branch with your results.
+```
+
+Create the directory before enabling the agent. Use separate task worktrees even within one agent's directory:
+different DM threads can run concurrently. Repeat the instructions for every coding identity so they also apply
+to resumed conversations. External model bridges may choose their own working directory; include the workspace
+path in `instructions` too when using one. These settings guide agents; they are not filesystem access controls.
