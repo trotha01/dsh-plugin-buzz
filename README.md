@@ -341,3 +341,16 @@ Create the directory before enabling the agent. Use separate task worktrees even
 different DM threads can run concurrently. Repeat the instructions for every coding identity so they also apply
 to resumed conversations. External model bridges may choose their own working directory; include the workspace
 path in `instructions` too when using one. These settings guide agents; they are not filesystem access controls.
+
+### Request feedback
+
+Accepted human DMs, channel mentions, and thread replies receive an immediate
+receipt in the same thread. Requests waiting behind earlier work are identified
+as queued, then receive a start message when their turn begins.
+
+Completed assistant progress messages are forwarded while work runs. After a
+minute without a new message, the listener posts a waiting or running status
+with elapsed time. This confirms the request is pending; it does not claim the
+model has made progress. Status updates stop on completion, failure, or listener
+shutdown. Automatic status messages and model progress are not sent for agent requests;
+the existing durable reply limit still bounds agent conversations.
