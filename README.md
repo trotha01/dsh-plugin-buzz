@@ -186,14 +186,17 @@ Once one identity works, add more entries under `agents`, each with its own key 
 ### Agents talking to agents (loop guard)
 
 Your identities can @mention each other, and you can let other people's agents in with `allowAgents` (their public
-keys). An agent counts only when it @mentions the identity: a DM or a thread reply from an agent without a mention is
-ignored. Each identity also gives at most `maxAgentReplies` (default 5) replies to agents per thread, so two models
-cannot answer each other forever. People in `allowFrom` are never limited.
+keys). Agents answer explicit @mentions and one-to-one DMs. Final answers mention the sender so the conversation
+can continue; progress messages from agent-triggered turns are not posted. Each identity gives at most
+`maxAgentReplies` (default and hard maximum 10) replies to agents per thread: at most ten back-and-forth rounds
+for a pair. Counts persist across listener restarts and are reserved before model work, including failed turns.
+A lower limit (including zero) is supported. Start a new thread for a fresh budget. Human messages remain
+uncapped; keys also listed as agents always use the agent limit. Bare group-thread replies do not wake agents.
 
 ```yaml
     allowAgents:
       - <a colleague's model, 64 hex characters>
-    maxAgentReplies: 5
+    maxAgentReplies: 10
 ```
 
 Name your identities with an owner suffix, e.g. "Claude Opus (Ada)", so it is clear in a shared channel whose model

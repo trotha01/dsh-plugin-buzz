@@ -39,13 +39,12 @@ const tagValues = (e, name) => (e.tags || []).filter((t) => t[0] === name).map((
  */
 export function route(e, { me, allowFrom, allowAgents = new Set(), dmChannels, threads }) {
   if (!e || e.kind !== 9 || e.pubkey === me) return null;
-  const fromAgent = !allowFrom.has(e.pubkey) && allowAgents.has(e.pubkey);
+  const fromAgent = allowAgents.has(e.pubkey);
   if (!allowFrom.has(e.pubkey) && !fromAgent) return null;
-  // Another agent counts only when it @mentions this one (no DM or thread follow-up), so two agents cannot keep a
-  // thread going by replying to each other's replies; listen() also caps replies to agents per thread.
-  if (fromAgent && !(e.tags || []).some((t) => t[0] === "p" && t[1] === me)) return null;
   const channel = tagValues(e, "h")[0];
   if (!channel) return null;
+  // Explicit mentions and one-to-one DMs let agents converse without waking every agent in a group thread.
+  if (fromAgent && !dmChannels.has(channel) && !tagValues(e, "p").includes(me)) return null;
   const refs = (e.tags || []).filter((t) => t[0] === "e" && HEX64.test(t[1] || ""));
   const known = refs.map((t) => t[1]).find((id) => threads.has(id));
   const mentioned = tagValues(e, "p").includes(me);
@@ -59,22 +58,25 @@ export function route(e, { me, allowFrom, allowAgents = new Set(), dmChannels, t
  * One identity's live connection. `answer(text, ctx)` returns the reply text; `send(reply)` posts it.
  * Reconnects with backoff and resubscribes from the last event seen, so a dropped socket loses nothing.
  */
-export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [], maxAgentReplies = 5, answer, send, log, store, WebSocketImpl = globalThis.WebSocket, now = () => Date.now() }) {
+export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [], maxAgentReplies = 10, answer, send, log, store, WebSocketImpl = globalThis.WebSocket, now = () => Date.now() }) {
   const me = bytesToHex(schnorr.getPublicKey(hexToBytes(secretHex)));
   const url = wsUrl(relayUrl);
   const allow = new Set(allowFrom);
   const agentsAllowed = new Set(allowAgents);
-  const agentReplies = new Map();     // thread key -> replies this identity gave to agents in that thread
+  const limit = Number.isSafeInteger(maxAgentReplies) ? Math.max(0, Math.min(10, maxAgentReplies)) : 10;
+  const { __agentReplies = {}, ...savedThreads } = store?.load?.() ?? {};
+  const agentReplies = new Map(Object.entries(__agentReplies));
+  const persist = () => store?.save?.({ ...Object.fromEntries(threads), __agentReplies: Object.fromEntries(agentReplies) });
   const dmChannels = new Set();
   const members = new Set();
   // event id -> thread key (root, the triggering message, our own replies). Kept in `store` across restarts, so a reply
   // without @mention in an older thread is still recognised after dsh restarts. At most 5000 ids, oldest dropped.
-  const threads = new Map(Object.entries(store?.load?.() ?? {}));
+  const threads = new Map(Object.entries(savedThreads));
   const remember = (id, key) => {
     if (!id) return;
     threads.delete(id); threads.set(id, key);
     while (threads.size > 5000) threads.delete(threads.keys().next().value);
-    store?.save?.(Object.fromEntries(threads));
+    persist();
   };
   const seen = new Set();
   const queues = new Map();           // thread key -> promise chain: one turn at a time per thread
@@ -98,8 +100,9 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
     if (!r) return;
     if (r.fromAgent) {
       const n = agentReplies.get(r.threadKey) ?? 0;
-      if (n >= maxAgentReplies) return void log({ event: "buzz_agent_cap", agent: name, thread: r.threadKey.slice(0, 12), replies: n });
+      if (n >= limit) return void log({ event: "buzz_agent_cap", agent: name, thread: r.threadKey.slice(0, 12), replies: n });
       agentReplies.set(r.threadKey, n + 1);
+      persist();
     }
     remember(e.id, r.threadKey); remember(r.replyTo, r.threadKey);
     const prev = queues.get(r.threadKey) ?? Promise.resolve();
@@ -109,9 +112,9 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
       let text, lastPosted;
       const post = async (text) => {
         if (closed || !text || text === lastPosted) return;
-        // An automatic @mention back to another agent would trigger it again,
-        // turning even a diagnostic acknowledgement into a reply loop.
-        const id = await send({ channel: r.channel, replyTo: r.replyTo, mention: r.fromAgent ? undefined : e.pubkey, text });
+        // Return mentions continue agent conversations; the persisted budget above
+        // caps them, and agent progress is suppressed below.
+        const id = await send({ channel: r.channel, replyTo: r.replyTo, mention: e.pubkey, text });
         if (id) remember(id, r.threadKey);
         lastPosted = text;
       };
@@ -122,7 +125,7 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
         try { await post(`(${name} received your message and is working on it.)`); }
         catch (err) { log({ event: "buzz_ack_error", agent: name, error: String(err?.message || err).slice(0, 200) }); }
       }
-      try { text = await answer(e.content, { threadKey: r.threadKey, event: e, onProgress: post }); }
+      try { text = await answer(e.content, { threadKey: r.threadKey, event: e, onProgress: r.fromAgent ? async () => {} : post }); }
       catch (err) { text = `(${name} could not answer: ${String(err?.message || err).slice(0, 300)})`; }
       if (closed) return;
       await post(text || "(no answer)");
