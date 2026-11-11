@@ -22,6 +22,8 @@ export const verifyEvent = (e) => {
   return id === e.id && schnorr.verify(hexToBytes(e.sig), hexToBytes(e.id), hexToBytes(e.pubkey));
 };
 
+/** A channel's member list (39002 p tags) makes it a DM when it is this identity plus at most one other. */
+export const isDm = (memberPubkeys, me) => { const m = new Set(memberPubkeys); return m.has(me) && m.size <= 2; };
 export const wsUrl = (relayUrl) => relayUrl.replace(/^http(s?):\/\//, "ws$1://").replace(/\/+$/, "");
 const tagValues = (e, name) => (e.tags || []).filter((t) => t[0] === name).map((t) => t[1]);
 
@@ -66,7 +68,7 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
   let ws, closed = false, delay = 1000, authed = false;
 
   const subscribe = () => {
-    ws.send(JSON.stringify(["REQ", "groups", { kinds: [39000, 39002], "#p": [me] }, { kinds: [39000], "#d": [...members] }]));
+    ws.send(JSON.stringify(["REQ", "groups", { kinds: [39000, 39002], "#p": [me] }, { kinds: [39000, 39002], "#d": [...members] }]));
     ws.send(JSON.stringify(["REQ", "mentions", { kinds: [9], "#p": [me], since }]));
     if (members.size) ws.send(JSON.stringify(["REQ", "channels", { kinds: [9], "#h": [...members], since }]));
     ws.send(JSON.stringify(["REQ", "membership", { kinds: [44100], "#p": [me], since }]));
@@ -108,11 +110,16 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
       if (e.kind === 39000 || e.kind === 39002) {
         const d = tagValues(e, "d")[0];
         if (!d) return;
-        if (e.kind === 39002 && tagValues(e, "p").includes(me) && !members.has(d)) { members.add(d); if (authed) ws.send(JSON.stringify(["REQ", "channels", { kinds: [9], "#h": [...members], since }])); }
+        if (e.kind === 39002 && tagValues(e, "p").includes(me)) {
+          // Buzz DMs are ordinary groups (named "DM", no marker tag): a channel whose only members are this identity and
+          // one other is treated as a DM, so every message there is for it.
+          if (isDm(tagValues(e, "p"), me)) dmChannels.add(d);
+          if (!members.has(d)) { members.add(d); if (authed) ws.send(JSON.stringify(["REQ", "channels", { kinds: [9], "#h": [...members], since }])); }
+        }
         if (e.kind === 39000 && (e.tags || []).some((t) => t[0] === "hidden" || (t[0] === "t" && t[1] === "dm"))) dmChannels.add(d);
       } else if (e.kind === 44100) {
         const d = tagValues(e, "h")[0] ?? tagValues(e, "d")[0];
-        if (d && !members.has(d)) { members.add(d); ws.send(JSON.stringify(["REQ", "groups-new", { kinds: [39000], "#d": [d] }])); ws.send(JSON.stringify(["REQ", "channels", { kinds: [9], "#h": [...members], since }])); }
+        if (d && !members.has(d)) { members.add(d); ws.send(JSON.stringify(["REQ", "groups-new", { kinds: [39000, 39002], "#d": [d] }])); ws.send(JSON.stringify(["REQ", "channels", { kinds: [9], "#h": [...members], since }])); }
       } else handle(e);
     } else if (m[0] === "CLOSED" && /auth-required/.test(String(m[2] || "")) && !authed) {
       log({ event: "buzz_waiting_for_auth", agent: name });

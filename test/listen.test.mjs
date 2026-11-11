@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { schnorr } from "@noble/curves/secp256k1.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
-import { signEvent, verifyEvent, route, listen, wsUrl } from "../listen.mjs";
+import { signEvent, verifyEvent, route, listen, wsUrl, isDm } from "../listen.mjs";
 import { sessionIdFor, finalText } from "../agent-turn.mjs";
 
 const AGENT = "11".repeat(32), OWNER = "22".repeat(32), OTHER = "33".repeat(32);
@@ -64,6 +64,35 @@ test("listen: loop guard caps replies to agents per thread; the owner is never c
   for (let i = 0; i < 3; i++) ws.emit("message", { data: JSON.stringify(["EVENT", "m", msg(OWNER, [["p", ME], ["e", root, "", "root"]], `owner ${i}`, 2_000_000_100 + i)]) });
   await new Promise((r) => setTimeout(r, 10));
   assert.equal(answers, 5);
+  conn.close();
+});
+
+test("DM detection: a channel of this identity plus one other is a DM; a bigger one is not", () => {
+  assert.equal(isDm([ME, OWNER_PK], ME), true);
+  assert.equal(isDm([ME, OWNER_PK, OTHER_PK], ME), false);
+  assert.equal(isDm([OWNER_PK, OTHER_PK], ME), false);
+});
+
+test("listen: a message without mention in a DM (learned from the member list) is answered", async () => {
+  const sockets = [];
+  class FakeWS {
+    constructor() { this.sent = []; this.h = {}; sockets.push(this); queueMicrotask(() => this.emit("message", { data: JSON.stringify(["AUTH", "c"]) })); }
+    addEventListener(t, f) { (this.h[t] ||= []).push(f); }
+    emit(t, ev) { for (const f of this.h[t] || []) f(ev); }
+    send(s) { this.sent.push(JSON.parse(s)); }
+    close() {}
+  }
+  const got = [];
+  const conn = listen({ name: "Codex", relayUrl: "https://r.example", secretHex: AGENT, allowFrom: [OWNER_PK], WebSocketImpl: FakeWS,
+    answer: async (t) => { got.push(t); return "ok"; }, send: async () => undefined, log: () => {} });
+  await new Promise((r) => setTimeout(r, 5));
+  const ws = sockets[0];
+  ws.emit("message", { data: JSON.stringify(["OK", ws.sent[0][1].id, true, ""]) });
+  const relay = "44".repeat(32);
+  ws.emit("message", { data: JSON.stringify(["EVENT", "groups", signEvent(relay, { kind: 39002, tags: [["d", CH], ["p", ME], ["p", OWNER_PK]] })]) });
+  ws.emit("message", { data: JSON.stringify(["EVENT", "channels", msg(OWNER, [], "plain DM")]) });
+  await new Promise((r) => setTimeout(r, 5));
+  assert.deepEqual(got, ["plain DM"]);
   conn.close();
 });
 
