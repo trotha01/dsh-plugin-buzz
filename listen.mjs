@@ -18,8 +18,14 @@ export function signEvent(secretHex, { kind, tags = [], content = "", created_at
   return { id, pubkey, created_at, kind, tags, content, sig };
 }
 export const verifyEvent = (e) => {
-  const id = bytesToHex(sha256(enc.encode(JSON.stringify([0, e.pubkey, e.created_at, e.kind, e.tags, e.content]))));
-  return id === e.id && schnorr.verify(hexToBytes(e.sig), hexToBytes(e.id), hexToBytes(e.pubkey));
+  try {
+    if (!e || !HEX64.test(e.id) || !HEX64.test(e.pubkey) || !/^[0-9a-f]{128}$/.test(e.sig) ||
+      !Number.isSafeInteger(e.created_at) || e.created_at < 0 || !Number.isSafeInteger(e.kind) ||
+      typeof e.content !== "string" || !Array.isArray(e.tags) ||
+      !e.tags.every(t => Array.isArray(t) && t.every(v => typeof v === "string"))) return false;
+    const id = bytesToHex(sha256(enc.encode(JSON.stringify([0, e.pubkey, e.created_at, e.kind, e.tags, e.content]))));
+    return id === e.id && schnorr.verify(hexToBytes(e.sig), hexToBytes(e.id), hexToBytes(e.pubkey));
+  } catch { return false; }
 };
 
 /** A channel's member list (39002 p tags) makes it a DM when it is this identity plus at most one other. */
@@ -53,7 +59,7 @@ export function route(e, { me, allowFrom, allowAgents = new Set(), dmChannels, t
  * One identity's live connection. `answer(text, ctx)` returns the reply text; `send(reply)` posts it.
  * Reconnects with backoff and resubscribes from the last event seen, so a dropped socket loses nothing.
  */
-export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [], maxAgentReplies = 5, answer, send, log, WebSocketImpl = globalThis.WebSocket, now = () => Date.now() }) {
+export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [], maxAgentReplies = 5, answer, send, log, store, WebSocketImpl = globalThis.WebSocket, now = () => Date.now() }) {
   const me = bytesToHex(schnorr.getPublicKey(hexToBytes(secretHex)));
   const url = wsUrl(relayUrl);
   const allow = new Set(allowFrom);
@@ -61,16 +67,27 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
   const agentReplies = new Map();     // thread key -> replies this identity gave to agents in that thread
   const dmChannels = new Set();
   const members = new Set();
-  const threads = new Map();          // event id -> thread key (root, the triggering message, our own replies)
+  // event id -> thread key (root, the triggering message, our own replies). Kept in `store` across restarts, so a reply
+  // without @mention in an older thread is still recognised after dsh restarts. At most 5000 ids, oldest dropped.
+  const threads = new Map(Object.entries(store?.load?.() ?? {}));
+  const remember = (id, key) => {
+    if (!id) return;
+    threads.delete(id); threads.set(id, key);
+    while (threads.size > 5000) threads.delete(threads.keys().next().value);
+    store?.save?.(Object.fromEntries(threads));
+  };
   const seen = new Set();
   const queues = new Map();           // thread key -> promise chain: one turn at a time per thread
   let since = Math.floor(now() / 1000);
   let ws, closed = false, delay = 1000, authed = false;
+  let connectionSince = since;
+  const subscribeChannel = (channel) => ws.send(JSON.stringify(["REQ", `channel:${channel}`,
+    { kinds: [9], "#h": [channel], since: connectionSince }]));
 
   const subscribe = () => {
     ws.send(JSON.stringify(["REQ", "groups", { kinds: [39000, 39002], "#p": [me] }, { kinds: [39000, 39002], "#d": [...members] }]));
     ws.send(JSON.stringify(["REQ", "mentions", { kinds: [9], "#p": [me], since }]));
-    if (members.size) ws.send(JSON.stringify(["REQ", "channels", { kinds: [9], "#h": [...members], since }]));
+    for (const channel of members) subscribeChannel(channel);
     ws.send(JSON.stringify(["REQ", "membership", { kinds: [44100], "#p": [me], since }]));
   };
   const handle = (e) => {
@@ -84,21 +101,39 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
       if (n >= maxAgentReplies) return void log({ event: "buzz_agent_cap", agent: name, thread: r.threadKey.slice(0, 12), replies: n });
       agentReplies.set(r.threadKey, n + 1);
     }
-    threads.set(e.id, r.threadKey); threads.set(r.replyTo, r.threadKey);
+    remember(e.id, r.threadKey); remember(r.replyTo, r.threadKey);
     const prev = queues.get(r.threadKey) ?? Promise.resolve();
     const next = prev.then(async () => {
+      if (closed) return;
       const t0 = now();
-      let text;
-      try { text = await answer(e.content, { threadKey: r.threadKey, event: e }); }
+      let text, lastPosted;
+      const post = async (text) => {
+        if (closed || !text || text === lastPosted) return;
+        // An automatic @mention back to another agent would trigger it again,
+        // turning even a diagnostic acknowledgement into a reply loop.
+        const id = await send({ channel: r.channel, replyTo: r.replyTo, mention: r.fromAgent ? undefined : e.pubkey, text });
+        if (id) remember(id, r.threadKey);
+        lastPosted = text;
+      };
+      // A provider or delegated task may take minutes before producing visible text.
+      // Confirm human DMs reached the listener before starting that work. A failed
+      // acknowledgement must not discard the user's request.
+      if (dmChannels.has(r.channel) && !r.fromAgent) {
+        try { await post(`(${name} received your message and is working on it.)`); }
+        catch (err) { log({ event: "buzz_ack_error", agent: name, error: String(err?.message || err).slice(0, 200) }); }
+      }
+      try { text = await answer(e.content, { threadKey: r.threadKey, event: e, onProgress: post }); }
       catch (err) { text = `(${name} could not answer: ${String(err?.message || err).slice(0, 300)})`; }
-      const id = await send({ channel: r.channel, replyTo: r.replyTo, mention: e.pubkey, text: text || "(no answer)" });
-      if (id) threads.set(id, r.threadKey);
+      if (closed) return;
+      await post(text || "(no answer)");
       log({ event: "buzz_turn", agent: name, thread: r.threadKey.slice(0, 12), ms: now() - t0, chars: (text || "").length });
     }).catch((err) => log({ event: "buzz_turn_error", agent: name, error: String(err?.message || err).slice(0, 200) }));
     queues.set(r.threadKey, next);
+    void next.finally(() => { if (queues.get(r.threadKey) === next) queues.delete(r.threadKey); });
   };
   const onMessage = (raw) => {
     let m; try { m = JSON.parse(typeof raw === "string" ? raw : raw.toString()); } catch { return; }
+    if (closed || !Array.isArray(m)) return;
     if (m[0] === "AUTH" && typeof m[1] === "string") {
       ws.send(JSON.stringify(["AUTH", signEvent(secretHex, { kind: 22242, tags: [["relay", url], ["challenge", m[1]]] })]));
     } else if (m[0] === "OK" && m[3] !== undefined && !authed) {
@@ -114,20 +149,29 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
           // Buzz DMs are ordinary groups (named "DM", no marker tag): a channel whose only members are this identity and
           // one other is treated as a DM, so every message there is for it.
           if (isDm(tagValues(e, "p"), me)) dmChannels.add(d);
-          if (!members.has(d)) { members.add(d); if (authed) ws.send(JSON.stringify(["REQ", "channels", { kinds: [9], "#h": [...members], since }])); }
+          else dmChannels.delete(d);
+          if (!members.has(d)) { members.add(d); if (authed) subscribeChannel(d); }
         }
         if (e.kind === 39000 && (e.tags || []).some((t) => t[0] === "hidden" || (t[0] === "t" && t[1] === "dm"))) dmChannels.add(d);
       } else if (e.kind === 44100) {
         const d = tagValues(e, "h")[0] ?? tagValues(e, "d")[0];
-        if (d && !members.has(d)) { members.add(d); ws.send(JSON.stringify(["REQ", "groups-new", { kinds: [39000, 39002], "#d": [d] }])); ws.send(JSON.stringify(["REQ", "channels", { kinds: [9], "#h": [...members], since }])); }
+        // Ask for the new channel's member list first; its 39002 (handled above) marks a DM and only then subscribes to
+        // the messages. Subscribing here would let the first message of a new DM arrive before the channel is known
+        // to be a DM, and it would be dropped as unaddressed chatter.
+        if (d && !members.has(d)) ws.send(JSON.stringify(["REQ", `groups-new:${d}`, { kinds: [39000, 39002], "#d": [d] }]));
       } else handle(e);
-    } else if (m[0] === "CLOSED" && /auth-required/.test(String(m[2] || "")) && !authed) {
-      log({ event: "buzz_waiting_for_auth", agent: name });
+    } else if (m[0] === "CLOSED") {
+      log({ event: "buzz_subscription_closed", agent: name, subscription: m[1], reason: String(m[2] || "").slice(0, 200) });
+      // CLOSED ends this subscription, not the socket. Leaving the connection open
+      // would look healthy while permanently missing that channel's messages.
+      // Reconnect through the existing backoff path and replay from the cursor.
+      try { ws.close(); } catch { /* close may already be in progress */ }
     }
   };
   const open = () => {
     if (closed) return;
     authed = false;
+    connectionSince = since;
     ws = new WebSocketImpl(url);
     ws.addEventListener("message", (ev) => onMessage(ev.data));
     ws.addEventListener("close", () => {
