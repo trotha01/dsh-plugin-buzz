@@ -191,7 +191,7 @@ test("listen: signs in on the relay's challenge, subscribes, answers a pushed me
   ws.emit("message", { data: JSON.stringify(["EVENT", "mentions", forged]) });
   await new Promise((r) => setTimeout(r, 5));
   assert.deepEqual(answered, [{ text: "17 times 23?", threadKey: mention.id }]);
-  assert.deepEqual(posted, [{ channel: CH, replyTo: mention.id, mention: OWNER_PK, text: "391" }]);
+  assert.deepEqual(posted, ["(Claude received your message and is starting work.)", "391"].map(text => ({ channel: CH, replyTo: mention.id, mention: OWNER_PK, text })));
 
   const followup = msg(OWNER, [["e", "cd".repeat(32), "", "reply"]], "and 18?", 2_000_000_001);   // reply to our answer
   ws.emit("message", { data: JSON.stringify(["EVENT", "channels", followup]) });
@@ -267,7 +267,7 @@ test("malformed relay frames do not interrupt subsequent messages and closing pr
   conn.close();
   finish("done");
   await new Promise(r => setImmediate(r));
-  assert.deepEqual(posted, []);
+  assert.deepEqual(posted.map(p => p.text), ["(A received your message and is starting work.)"]);
 });
 
 test("DM discovery uses the connection cursor even after newer traffic in another channel", async () => {
@@ -303,9 +303,9 @@ test("progress is sent before completion, final text is deduplicated, and later 
     send:async r => { posts.push(r.text); return 'de'.repeat(32); }});
   ws.message(['EVENT','mentions',msg(OWNER,[['p',ME]])]);
   await ready;
-  assert.deepEqual(posts,['Working']);
+  assert.deepEqual(posts,['(Grok received your message and is starting work.)','Working']);
   finish(); await new Promise(r=>setImmediate(r));
-  assert.deepEqual(posts,['Working','Finished']); c.close();
+  assert.deepEqual(posts,['(Grok received your message and is starting work.)','Working','Finished']); c.close();
 });
 
 test("concurrent new DMs keep independent discovery and message subscriptions", async () => {
@@ -357,10 +357,10 @@ test('human DMs are acknowledged before model work; receipt failure still runs t
       ws.message(['EVENT','groups',signEvent(OTHER,{kind:39002,tags:[['d',CH],['p',ME],['p',OWNER_PK]]})]);
       ws.message(['EVENT','channel',msg(OWNER,[])]);
       await ready;
-      assert.deepEqual(posts,['(Grok received your message and is working on it.)']);
+      assert.deepEqual(posts,['(Grok received your message and is starting work.)']);
       finish(); await new Promise(r=>setImmediate(r));
       assert.equal(posts.at(-1),'Done');
-      assert.equal(logs.some(e=>e.event==='buzz_ack_error'),failReceipt);
+      assert.equal(logs.some(e=>e.event==='buzz_status_error'),failReceipt);
     } finally { finish(); c.close(); }
   }
 });
@@ -399,4 +399,94 @@ test('two agents exchange ten rounds, suppress progress, and retain the cap acro
     await new Promise(r=>setImmediate(r));
     assert.deepEqual(counts,[10,10]);
   } finally {for(const c of connections)c.close();}
+});
+
+const flush = () => new Promise(resolve => setImmediate(resolve));
+
+function feedbackListener(options = {}) {
+  let ws;
+  const posts = [], logs = [];
+  class FakeWS {
+    constructor() { ws = this; }
+    addEventListener(t, f) { if (t === 'message') this.message = m => f({data: JSON.stringify(m)}); }
+    send() {} close() {}
+  }
+  const connection = listen({name:'Manager', relayUrl:'https://relay.example', secretHex:AGENT,
+    allowFrom:[OWNER_PK], WebSocketImpl:FakeWS, log:e=>logs.push(e),
+    send:async r=>posts.push(r), ...options});
+  return {connection, posts, logs, emit:e=>ws.message(['EVENT','test',e])};
+}
+
+test('queued channel requests receive immediate receipts, periodic status, and a start update', async t => {
+  t.mock.timers.enable({apis:['setInterval','Date'], now:2000000000000});
+  let finish;
+  const waiting = new Promise(r=>finish=r), started=[];
+  const f=feedbackListener({answer:async text=>{started.push(text); if(text==='first') await waiting; return 'Done '+text;}});
+  try {
+    const first=msg(OWNER,[['p',ME]],'first');
+    f.emit(first); f.emit(first);
+    await flush();
+    f.emit(msg(OWNER,[['e',first.id,'','reply']],'second'));
+    await flush();
+    assert.deepEqual(started,['first']);
+    assert.equal(f.posts.length,2);
+    assert.match(f.posts[1].text,/received.*queued/);
+    t.mock.timers.tick(60000); await flush();
+    assert.match(f.posts[2].text,/still running after 60s/);
+    assert.match(f.posts[3].text,/still queued after 60s/);
+    finish(); await flush();
+    assert.deepEqual(started,['first','second']);
+    assert.ok(f.posts.some(p=>/now starting your queued/.test(p.text)));
+    assert.equal(f.posts.at(-1).text,'Done second');
+    const count=f.posts.length;
+    t.mock.timers.tick(120000); await flush();
+    assert.equal(f.posts.length,count);
+  } finally {finish();f.connection.close();}
+});
+
+test('model progress resets status silence and closing stops status delivery', async t => {
+  t.mock.timers.enable({apis:['setInterval','Date'], now:2000000000000});
+  let progress, finish;
+  const waiting=new Promise(r=>finish=r);
+  const f=feedbackListener({answer:async (_,ctx)=>{progress=ctx.onProgress;await waiting;return 'Done';}});
+  try {
+    f.emit(msg(OWNER,[['p',ME]])); await flush();
+    t.mock.timers.tick(30000); await progress('Research complete');
+    t.mock.timers.tick(30000); await flush();
+    assert.equal(f.posts.length,2);
+    t.mock.timers.tick(60000); await flush();
+    assert.match(f.posts.at(-1).text,/still running/);
+    // Heartbeats must not cause a duplicate final model message.
+    await progress('Research complete');
+    assert.equal(f.posts.length,3);
+    f.connection.close();
+    t.mock.timers.tick(120000); finish(); await flush();
+    assert.equal(f.posts.length,3);
+  } finally {finish();f.connection.close();}
+});
+
+test('failed receipts do not discard DMs; failures finish status updates', async t => {
+  t.mock.timers.enable({apis:['setInterval','Date'], now:2000000000000});
+  const posts=[];
+  const f=feedbackListener({send:async r=>{posts.push(r.text);if(posts.length===1)throw Error('offline');},
+    answer:async()=>{throw Error('test failure');}});
+  try {
+    f.emit(signEvent(OTHER,{kind:39002,tags:[['d',CH],['p',ME],['p',OWNER_PK]]}));
+    f.emit(msg(OWNER,[])); await flush();
+    assert.match(posts[0],/received/);
+    assert.match(posts[1],/could not answer/);
+    assert.equal(f.logs[0].event,'buzz_status_error');
+    t.mock.timers.tick(120000); await flush();assert.equal(posts.length,2);
+  } finally {f.connection.close();}
+});
+
+test('agent requests receive no automatic status', async t => {
+  t.mock.timers.enable({apis:['setInterval','Date'], now:2000000000000});
+  let finish; const waiting=new Promise(r=>finish=r);
+  const f=feedbackListener({allowAgents:[OTHER_PK],answer:async()=>{await waiting;return 'Done';}});
+  try {
+    f.emit(msg(OTHER,[['p',ME]]));await flush();
+    t.mock.timers.tick(120000);await flush();assert.equal(f.posts.length,0);
+    finish();await flush();assert.equal(f.posts.length,1);assert.equal(f.posts[0].mention,OTHER_PK);
+  } finally {finish();f.connection.close();}
 });

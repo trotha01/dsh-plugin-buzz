@@ -58,7 +58,7 @@ export function route(e, { me, allowFrom, allowAgents = new Set(), dmChannels, t
  * One identity's live connection. `answer(text, ctx)` returns the reply text; `send(reply)` posts it.
  * Reconnects with backoff and resubscribes from the last event seen, so a dropped socket loses nothing.
  */
-export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [], maxAgentReplies = 10, answer, send, log, store, WebSocketImpl = globalThis.WebSocket, now = () => Date.now() }) {
+export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [], maxAgentReplies = 10, answer, send, log, store, WebSocketImpl = globalThis.WebSocket, now = () => Date.now(), statusIntervalMs = 60_000 }) {
   const me = bytesToHex(schnorr.getPublicKey(hexToBytes(secretHex)));
   const url = wsUrl(relayUrl);
   const allow = new Set(allowFrom);
@@ -79,6 +79,7 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
     persist();
   };
   const seen = new Set();
+  const statusTimers = new Set();
   const queues = new Map();           // thread key -> promise chain: one turn at a time per thread
   let since = Math.floor(now() / 1000);
   let ws, closed = false, delay = 1000, authed = false;
@@ -105,32 +106,59 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
       persist();
     }
     remember(e.id, r.threadKey); remember(r.replyTo, r.threadKey);
-    const prev = queues.get(r.threadKey) ?? Promise.resolve();
-    const next = prev.then(async () => {
-      if (closed) return;
-      const t0 = now();
-      let text, lastPosted;
-      const post = async (text) => {
-        if (closed || !text || text === lastPosted) return;
-        // Return mentions continue agent conversations; the persisted budget above
-        // caps them, and agent progress is suppressed below.
-        const id = await send({ channel: r.channel, replyTo: r.replyTo, mention: e.pubkey, text });
+    const previous = queues.get(r.threadKey);
+    const receivedAt = now();
+    let lastActivity = receivedAt, lastModelText, delivery = Promise.resolve();
+    let active = false, finished = false;
+    // Serialize all sends so a slow status delivery cannot overtake the final answer.
+    const post = (text, modelText = false) => {
+      const pending = delivery.then(async () => {
+        if (closed || !text || (modelText && text === lastModelText)) return;
+        const id = await send({ channel: r.channel, replyTo: r.replyTo,
+          mention: e.pubkey, text });
         if (id) remember(id, r.threadKey);
-        lastPosted = text;
-      };
-      // A provider or delegated task may take minutes before producing visible text.
-      // Confirm human DMs reached the listener before starting that work. A failed
-      // acknowledgement must not discard the user's request.
-      if (dmChannels.has(r.channel) && !r.fromAgent) {
-        try { await post(`(${name} received your message and is working on it.)`); }
-        catch (err) { log({ event: "buzz_ack_error", agent: name, error: String(err?.message || err).slice(0, 200) }); }
-      }
-      try { text = await answer(e.content, { threadKey: r.threadKey, event: e, onProgress: r.fromAgent ? async () => {} : post }); }
-      catch (err) { text = `(${name} could not answer: ${String(err?.message || err).slice(0, 300)})`; }
+        lastActivity = now();
+        if (modelText) lastModelText = text;
+      });
+      delivery = pending.catch(() => {});
+      return pending;
+    };
+    const status = (text) => post(text).catch(err =>
+      log({ event: "buzz_status_error", agent: name, error: String(err?.message || err).slice(0, 200) }));
+    // Receipt is outside the thread queue: even a queued request is acknowledged now.
+    const receipt = r.fromAgent ? Promise.resolve() : status(previous
+      ? `(${name} received your message. It is queued behind an earlier request in this thread.)`
+      : `(${name} received your message and is starting work.)`);
+    let timer;
+    if (!r.fromAgent) {
+      timer = setInterval(() => {
+        if (closed || finished || now() - lastActivity < statusIntervalMs) return;
+        // Reserve this interval even when the relay is slow or unavailable.
+        lastActivity = now();
+        const seconds = Math.floor((now() - receivedAt) / 1000);
+        void status(active
+          ? `(${name}: your request is still running after ${seconds}s. No new progress report yet; I will post the result here.)`
+          : `(${name}: your request is still queued after ${seconds}s, waiting for the earlier request in this thread.)`);
+      }, statusIntervalMs);
+      timer.unref?.();
+      statusTimers.add(timer);
+    }
+    const next = (previous ?? Promise.resolve()).then(async () => {
+      await receipt;
       if (closed) return;
-      await post(text || "(no answer)");
+      active = true;
+      const t0 = now();
+      if (previous && !r.fromAgent) await status(`(${name} is now starting your queued request.)`);
+      let text;
+      try { text = await answer(e.content, { threadKey: r.threadKey, event: e, onProgress: r.fromAgent ? async () => {} : text => post(text, true) }); }
+      catch (err) { text = `(${name} could not answer: ${String(err?.message || err).slice(0, 300)})`; }
+      finished = true;
+      clearInterval(timer);
+      if (closed) return;
+      await post(text || "(no answer)", true);
       log({ event: "buzz_turn", agent: name, thread: r.threadKey.slice(0, 12), ms: now() - t0, chars: (text || "").length });
-    }).catch((err) => log({ event: "buzz_turn_error", agent: name, error: String(err?.message || err).slice(0, 200) }));
+    }).catch((err) => log({ event: "buzz_turn_error", agent: name, error: String(err?.message || err).slice(0, 200) }))
+      .finally(() => { finished = true; clearInterval(timer); statusTimers.delete(timer); });
     queues.set(r.threadKey, next);
     void next.finally(() => { if (queues.get(r.threadKey) === next) queues.delete(r.threadKey); });
   };
@@ -185,5 +213,5 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
     ws.addEventListener("error", () => { try { ws.close(); } catch { /* close handler reconnects */ } });
   };
   open();
-  return { me, close() { closed = true; try { ws?.close(); } catch { /* already closed */ } } };
+  return { me, close() { closed = true; for (const timer of statusTimers) clearInterval(timer); statusTimers.clear(); try { ws?.close(); } catch { /* already closed */ } } };
 }
