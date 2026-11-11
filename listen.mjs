@@ -53,7 +53,7 @@ export function route(e, { me, allowFrom, allowAgents = new Set(), dmChannels, t
  * One identity's live connection. `answer(text, ctx)` returns the reply text; `send(reply)` posts it.
  * Reconnects with backoff and resubscribes from the last event seen, so a dropped socket loses nothing.
  */
-export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [], maxAgentReplies = 5, answer, send, log, WebSocketImpl = globalThis.WebSocket, now = () => Date.now() }) {
+export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [], maxAgentReplies = 5, answer, send, log, store, WebSocketImpl = globalThis.WebSocket, now = () => Date.now() }) {
   const me = bytesToHex(schnorr.getPublicKey(hexToBytes(secretHex)));
   const url = wsUrl(relayUrl);
   const allow = new Set(allowFrom);
@@ -61,7 +61,15 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
   const agentReplies = new Map();     // thread key -> replies this identity gave to agents in that thread
   const dmChannels = new Set();
   const members = new Set();
-  const threads = new Map();          // event id -> thread key (root, the triggering message, our own replies)
+  // event id -> thread key (root, the triggering message, our own replies). Kept in `store` across restarts, so a reply
+  // without @mention in an older thread is still recognised after dsh restarts. At most 5000 ids, oldest dropped.
+  const threads = new Map(Object.entries(store?.load?.() ?? {}));
+  const remember = (id, key) => {
+    if (!id) return;
+    threads.delete(id); threads.set(id, key);
+    while (threads.size > 5000) threads.delete(threads.keys().next().value);
+    store?.save?.(Object.fromEntries(threads));
+  };
   const seen = new Set();
   const queues = new Map();           // thread key -> promise chain: one turn at a time per thread
   let since = Math.floor(now() / 1000);
@@ -84,7 +92,7 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
       if (n >= maxAgentReplies) return void log({ event: "buzz_agent_cap", agent: name, thread: r.threadKey.slice(0, 12), replies: n });
       agentReplies.set(r.threadKey, n + 1);
     }
-    threads.set(e.id, r.threadKey); threads.set(r.replyTo, r.threadKey);
+    remember(e.id, r.threadKey); remember(r.replyTo, r.threadKey);
     const prev = queues.get(r.threadKey) ?? Promise.resolve();
     const next = prev.then(async () => {
       const t0 = now();
@@ -92,7 +100,7 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
       try { text = await answer(e.content, { threadKey: r.threadKey, event: e }); }
       catch (err) { text = `(${name} could not answer: ${String(err?.message || err).slice(0, 300)})`; }
       const id = await send({ channel: r.channel, replyTo: r.replyTo, mention: e.pubkey, text: text || "(no answer)" });
-      if (id) threads.set(id, r.threadKey);
+      if (id) remember(id, r.threadKey);
       log({ event: "buzz_turn", agent: name, thread: r.threadKey.slice(0, 12), ms: now() - t0, chars: (text || "").length });
     }).catch((err) => log({ event: "buzz_turn_error", agent: name, error: String(err?.message || err).slice(0, 200) }));
     queues.set(r.threadKey, next);

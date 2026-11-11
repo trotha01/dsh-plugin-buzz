@@ -4,6 +4,7 @@
 // relay and answers your messages to it right away (push, no polling) with a fixed dsh provider/model.
 // Plain ESM, no build step. Settings come from the row's config, else from the environment dsh runs in.
 import { execFile } from 'node:child_process'
+import { readFileSync, writeFileSync, renameSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import Schema from '@deepseek-ai/schemastery'
 import * as mcpClient from '@deepseek-ai/dsh-mcp-client'
@@ -54,6 +55,15 @@ export function resolve(config = {}, env = process.env) {
     command: process.execPath,          // the same Node that runs dsh
     args: [SERVER],
     env: childEnv,
+  }
+}
+
+/** Thread memory for one identity: <keyFile>.threads.json beside the key (0600), so it survives restarts. */
+export function threadStore(keyFile) {
+  const file = `${keyFile}.threads.json`
+  return {
+    load() { try { return JSON.parse(readFileSync(file, 'utf8')) } catch { return {} } },
+    save(obj) { try { writeFileSync(`${file}.tmp`, JSON.stringify(obj), { mode: 0o600 }); renameSync(`${file}.tmp`, file) } catch { /* memory only */ } },
   }
 }
 
@@ -114,6 +124,7 @@ export async function apply(ctx, config) {
       name: a.name, relayUrl, secretHex, allowFrom, allowAgents, maxAgentReplies,
       answer: makeAnswerer(ctx, { ...a, cwd }, deps),
       send: makeSender({ relayUrl, keyFile: a.keyFile, cli }),
+      store: threadStore(a.keyFile),
       log: (o) => say(JSON.stringify(o)),
     })
     // A config reload can apply this plugin again without disposing the old instance; one listener per identity per

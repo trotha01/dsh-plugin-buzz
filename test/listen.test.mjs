@@ -67,6 +67,38 @@ test("listen: loop guard caps replies to agents per thread; the owner is never c
   conn.close();
 });
 
+test("threads survive a restart: a reply without @mention in a remembered channel thread is answered by a new listener", async () => {
+  let saved = {};
+  const store = { load: () => saved, save: (o) => { saved = o; } };
+  const mk = (got) => {
+    const sockets = [];
+    class FakeWS {
+      constructor() { this.sent = []; this.h = {}; sockets.push(this); queueMicrotask(() => this.emit("message", { data: JSON.stringify(["AUTH", "c"]) })); }
+      addEventListener(t, f) { (this.h[t] ||= []).push(f); }
+      emit(t, ev) { for (const f of this.h[t] || []) f(ev); }
+      send(s) { this.sent.push(JSON.parse(s)); }
+      close() {}
+    }
+    const conn = listen({ name: "A", relayUrl: "https://r.example", secretHex: AGENT, allowFrom: [OWNER_PK], store, WebSocketImpl: FakeWS,
+      answer: async (t, { threadKey }) => { got.push([t, threadKey]); return "ok"; }, send: async () => "be".repeat(32), log: () => {} });
+    return { conn, ws: () => sockets[0] };
+  };
+  const got1 = [], a = mk(got1);
+  await new Promise((r) => setTimeout(r, 5));
+  a.ws().emit("message", { data: JSON.stringify(["OK", a.ws().sent[0][1].id, true, ""]) });
+  const first = msg(OWNER, [["p", ME]], "start");
+  a.ws().emit("message", { data: JSON.stringify(["EVENT", "m", first]) });
+  await new Promise((r) => setTimeout(r, 5));
+  a.conn.close();
+  const got2 = [], b = mk(got2);                                                    // "after a restart"
+  await new Promise((r) => setTimeout(r, 5));
+  b.ws().emit("message", { data: JSON.stringify(["OK", b.ws().sent[0][1].id, true, ""]) });
+  b.ws().emit("message", { data: JSON.stringify(["EVENT", "c", msg(OWNER, [["e", "be".repeat(32), "", "reply"]], "follow-up", 2_000_000_050)]) });
+  await new Promise((r) => setTimeout(r, 5));
+  assert.deepEqual(got2, [["follow-up", first.id]]);
+  b.conn.close();
+});
+
 test("DM detection: a channel of this identity plus one other is a DM; a bigger one is not", () => {
   assert.equal(isDm([ME, OWNER_PK], ME), true);
   assert.equal(isDm([ME, OWNER_PK, OTHER_PK], ME), false);
