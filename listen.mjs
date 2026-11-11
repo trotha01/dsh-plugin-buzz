@@ -109,10 +109,19 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
       let text, lastPosted;
       const post = async (text) => {
         if (closed || !text || text === lastPosted) return;
-        const id = await send({ channel: r.channel, replyTo: r.replyTo, mention: e.pubkey, text });
+        // An automatic @mention back to another agent would trigger it again,
+        // turning even a diagnostic acknowledgement into a reply loop.
+        const id = await send({ channel: r.channel, replyTo: r.replyTo, mention: r.fromAgent ? undefined : e.pubkey, text });
         if (id) remember(id, r.threadKey);
         lastPosted = text;
       };
+      // A provider or delegated task may take minutes before producing visible text.
+      // Confirm human DMs reached the listener before starting that work. A failed
+      // acknowledgement must not discard the user's request.
+      if (dmChannels.has(r.channel) && !r.fromAgent) {
+        try { await post(`(${name} received your message and is working on it.)`); }
+        catch (err) { log({ event: "buzz_ack_error", agent: name, error: String(err?.message || err).slice(0, 200) }); }
+      }
       try { text = await answer(e.content, { threadKey: r.threadKey, event: e, onProgress: post }); }
       catch (err) { text = `(${name} could not answer: ${String(err?.message || err).slice(0, 300)})`; }
       if (closed) return;

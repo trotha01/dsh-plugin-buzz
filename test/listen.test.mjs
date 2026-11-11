@@ -338,3 +338,49 @@ test("concurrent new DMs keep independent discovery and message subscriptions", 
     assert.deepEqual(answered, channels);
   } finally { c.close(); }
 });
+
+test('human DMs are acknowledged before model work; receipt failure still runs the request', async () => {
+  for (const failReceipt of [false, true]) {
+    let ws, finish, started;
+    const ready = new Promise(r => started = r), done = new Promise(r => finish = r);
+    const posts = [], logs = [];
+    class FakeWS {
+      constructor() { ws = this; }
+      addEventListener(t, f) { if (t === 'message') this.message = m => f({data: JSON.stringify(m)}); }
+      send() {} close() {}
+    }
+    const c = listen({name:'Grok',relayUrl:'https://relay.example',secretHex:AGENT,allowFrom:[OWNER_PK],WebSocketImpl:FakeWS,
+      log:e=>logs.push(e),answer:async()=>{started();await done;return 'Done';},send:async r=>{
+        posts.push(r.text); if (failReceipt && posts.length === 1) throw new Error('offline');
+      }});
+    try {
+      ws.message(['EVENT','groups',signEvent(OTHER,{kind:39002,tags:[['d',CH],['p',ME],['p',OWNER_PK]]})]);
+      ws.message(['EVENT','channel',msg(OWNER,[])]);
+      await ready;
+      assert.deepEqual(posts,['(Grok received your message and is working on it.)']);
+      finish(); await new Promise(r=>setImmediate(r));
+      assert.equal(posts.at(-1),'Done');
+      assert.equal(logs.some(e=>e.event==='buzz_ack_error'),failReceipt);
+    } finally { finish(); c.close(); }
+  }
+});
+
+test('automatic replies to agents do not mention them and trigger a reply loop', async () => {
+  let ws;
+  const posts=[];
+  class FakeWS {
+    constructor(){ws=this;}
+    addEventListener(t,f){if(t==='message')this.message=m=>f({data:JSON.stringify(m)});}
+    send(){} close(){}
+  }
+  const c=listen({name:'Grok',relayUrl:'https://relay.example',secretHex:AGENT,allowFrom:[OWNER_PK],allowAgents:[OTHER_PK],
+    WebSocketImpl:FakeWS,log:()=>{},answer:async()=> 'Acknowledged',send:async r=>posts.push(r)});
+  try {
+    ws.message(['EVENT','mentions',msg(OTHER,[['p',ME]])]);
+    await new Promise(r=>setImmediate(r));
+    assert.equal(posts.length,1);
+    assert.equal(posts[0].mention,undefined);
+    const reply=signEvent(AGENT,{kind:9,tags:[['h',CH],['e',posts[0].replyTo,'','reply']],content:posts[0].text});
+    assert.equal(route(reply,{me:OTHER_PK,allowFrom:new Set(),allowAgents:new Set([ME]),dmChannels:new Set([CH]),threads:new Map()}),null);
+  } finally {c.close();}
+});
