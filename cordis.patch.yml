@@ -1,0 +1,6 @@
+# dsh-plugin-buzz: one row = one Buzz identity. With no config the row reads BUZZ_KEY_FILE, BUZZ_RELAY_URL and
+# BUZZ_CLI from the environment dsh was started with, and stays idle (one log line) until a key file and a relay
+# are set. To configure it in YAML instead, or to add a second identity, see the README.
+- insert:
+    - id: buzz
+      name: dsh-plugin-buzz

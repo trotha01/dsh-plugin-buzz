@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Buzz chat",
+    "description": "Agents read and post in Buzz channels as their own Buzz identity. Needs the buzz CLI, a key file and your relay address."
+  }
+}
