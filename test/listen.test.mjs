@@ -11,6 +11,36 @@ const ME = pub(AGENT), OWNER_PK = pub(OWNER), OTHER_PK = pub(OTHER);
 const CH = "a6f725b6-ce62-477e-bb7c-3b041b00a32f";
 const msg = (sec, tags, content = "hi", t = 2_000_000_000) => signEvent(sec, { kind: 9, tags: [["h", CH], ...tags], content, created_at: t });
 
+test('a relay-closed subscription reconnects and resumes its DM cursor', {timeout: 5000}, async () => {
+  const sockets = [], answered = [];
+  let reconnected;
+  const ready = new Promise(resolve => { reconnected = resolve; });
+  class FakeWS {
+    constructor() { this.h = {}; this.sent = []; sockets.push(this); if (sockets.length === 2) reconnected(this); }
+    addEventListener(type, fn) { this.h[type] = fn; }
+    send(raw) { this.sent.push(JSON.parse(raw)); }
+    message(frame) { this.h.message({data: JSON.stringify(frame)}); }
+    close() { this.h.close?.(); }
+  }
+  const c = listen({name:'Grok',relayUrl:'https://relay.example',secretHex:AGENT,allowFrom:[OWNER_PK],
+    now:()=>1000000,WebSocketImpl:FakeWS,log:()=>{},answer:async text=>{answered.push(text);return 'ok';},send:async()=>undefined});
+  try {
+    const ws = sockets[0];
+    ws.message(['OK','auth',true,'']);
+    ws.message(['EVENT','groups',signEvent(OTHER,{kind:39002,tags:[['d',CH],['p',ME],['p',OWNER_PK]]})]);
+    const first = msg(OWNER, [], 'before disconnect', 1050);
+    ws.message(['EVENT',`channel:${CH}`,first]);
+    ws.message(['CLOSED',`channel:${CH}`,'temporary failure']);
+    const next = await ready;
+    next.message(['OK','auth',true,'']);
+    assert.equal(next.sent.find(m=>m[1]===`channel:${CH}`)[2].since,1050);
+    next.message(['EVENT',`channel:${CH}`,first]);
+    next.message(['EVENT',`channel:${CH}`,msg(OWNER, [], 'after reconnect', 1051)]);
+    await new Promise(resolve=>setImmediate(resolve));
+    assert.deepEqual(answered,['before disconnect','after reconnect']);
+  } finally { c.close(); }
+});
+
 test("signed events verify; a changed event does not; http(s) relay URLs become ws(s)", () => {
   const e = signEvent(AGENT, { kind: 22242, tags: [["challenge", "x"]] });
   assert.equal(e.pubkey, ME);
@@ -197,9 +227,9 @@ test("listen: the first message of a brand-new DM is answered (member list is fe
   ws.emit("message", { data: JSON.stringify(["OK", ws.sent[0][1].id, true, ""]) });
   const relay = "44".repeat(32);
   ws.emit("message", { data: JSON.stringify(["EVENT", "membership", signEvent(relay, { kind: 44100, tags: [["h", CH], ["p", ME]] })]) });
-  const subscribedToCh = () => ws.sent.some((m) => m[0] === "REQ" && m[1] === "channels" && m[2]["#h"].includes(CH));
+  const subscribedToCh = () => ws.sent.some((m) => m[0] === "REQ" && m[1] === `channel:${CH}` && m[2]["#h"].includes(CH));
   assert.ok(!subscribedToCh(), "no message subscription before the member list");
-  assert.ok(ws.sent.some((m) => m[1] === "groups-new" && m[2]["#d"][0] === CH));
+  assert.ok(ws.sent.some((m) => m[1] === `groups-new:${CH}` && m[2]["#d"][0] === CH));
   ws.emit("message", { data: JSON.stringify(["EVENT", "groups-new", signEvent(relay, { kind: 39002, tags: [["d", CH], ["p", ME], ["p", OWNER_PK]] })]) });
   assert.ok(subscribedToCh());
   ws.emit("message", { data: JSON.stringify(["EVENT", "channels", msg(OWNER, [], "first DM")]) });
@@ -238,4 +268,73 @@ test("malformed relay frames do not interrupt subsequent messages and closing pr
   finish("done");
   await new Promise(r => setImmediate(r));
   assert.deepEqual(posted, []);
+});
+
+test("DM discovery uses the connection cursor even after newer traffic in another channel", async () => {
+  let ws;
+  class FakeWS {
+    constructor() { ws = this; this.sent = []; this.h = {}; }
+    addEventListener(t, f) { this.h[t] = f; }
+    send(s) { this.sent.push(JSON.parse(s)); }
+    close() {}
+    message(m) { this.h.message({ data: JSON.stringify(m) }); }
+  }
+  const c = listen({ name: 'A', relayUrl: 'https://relay.example', secretHex: AGENT, allowFrom: [OWNER_PK],
+    now: () => 1000000, WebSocketImpl: FakeWS, log: () => {}, answer: async () => 'ok', send: async () => undefined });
+  ws.message(['OK', 'auth', true, '']);
+  ws.message(['EVENT', 'mentions', msg(OWNER, [['p', ME]], 'newer', 1100)]);
+  ws.message(['EVENT', 'groups', signEvent(OTHER, {kind:39002, tags:[['d', CH], ['p', ME], ['p', OWNER_PK]]})]);
+  const req = ws.sent.find(m => m[1] === `channel:${CH}`);
+  assert.equal(req[2].since, 1000, 'must include the DM message at 1050');
+  c.close();
+});
+
+test("progress is sent before completion, final text is deduplicated, and later results are delivered", async () => {
+  let ws, finish, progressSent;
+  const ready = new Promise(r => progressSent = r), done = new Promise(r => finish = r);
+  class FakeWS {
+    constructor() { ws = this; }
+    addEventListener(t, f) { if (t === 'message') this.message = m => f({ data: JSON.stringify(m) }); }
+    send() {} close() {}
+  }
+  const posts = [];
+  const c = listen({name:'Grok',relayUrl:'https://relay.example',secretHex:AGENT,allowFrom:[OWNER_PK],WebSocketImpl:FakeWS,log:()=>{},
+    answer:async (text, {onProgress}) => { await onProgress('Working'); await onProgress('Working'); progressSent(); await done; await onProgress('Finished'); return 'Finished'; },
+    send:async r => { posts.push(r.text); return 'de'.repeat(32); }});
+  ws.message(['EVENT','mentions',msg(OWNER,[['p',ME]])]);
+  await ready;
+  assert.deepEqual(posts,['Working']);
+  finish(); await new Promise(r=>setImmediate(r));
+  assert.deepEqual(posts,['Working','Finished']); c.close();
+});
+
+test("concurrent new DMs keep independent discovery and message subscriptions", async () => {
+  let ws;
+  class FakeWS {
+    constructor() { ws = this; this.active = new Map(); }
+    addEventListener(t, f) { if (t === 'message') this.message = m => f({data: JSON.stringify(m)}); }
+    send(raw) { const [type, id, filter] = JSON.parse(raw); if (type === 'REQ') this.active.set(id, filter); }
+    close() {}
+  }
+  const answered = [];
+  const c = listen({name:'Grok', relayUrl:'https://relay.example', secretHex:AGENT, allowFrom:[OWNER_PK],
+    WebSocketImpl:FakeWS, log:()=>{}, answer:async text => { answered.push(text); return 'ok'; }, send:async()=>undefined});
+  try {
+    ws.message(['OK', 'auth', true, '']);
+    const channels = [CH, 'b6f725b6-ce62-477e-bb7c-3b041b00a32f'];
+    for (const channel of channels) ws.message(['EVENT', 'membership', signEvent(OTHER,
+      {kind:44100, tags:[['h',channel],['p',ME]]})]);
+    for (const channel of channels) {
+      assert.deepEqual(ws.active.get(`groups-new:${channel}`)['#d'], [channel]);
+      ws.message(['EVENT', `groups-new:${channel}`, signEvent(OTHER,
+        {kind:39002, tags:[['d',channel],['p',ME],['p',OWNER_PK]]})]);
+    }
+    for (const channel of channels) {
+      assert.deepEqual(ws.active.get(`channel:${channel}`)['#h'], [channel]);
+      ws.message(['EVENT', `channel:${channel}`, signEvent(OWNER,
+        {kind:9, tags:[['h',channel]], content:channel})]);
+    }
+    await new Promise(r=>setImmediate(r));
+    assert.deepEqual(answered, channels);
+  } finally { c.close(); }
 });

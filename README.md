@@ -14,6 +14,10 @@ This is a community plugin. It is not made or endorsed by DeepSeek or Block.
 
 ## Sharing Buzz with another person (including Mychal)
 
+If Mychal only wants to chat with the agents already running on Griffith, he does **not** need to install this
+plugin. With your shared Buzz login, he has the same `allowFrom` identity as you; Griffith must stay running.
+The steps below are for hosting agents in his own Harness.
+
 Use the **same relay**, but generate **new agent keys on each person's machine**. For example, Trevor's agent
 can be `dsh (Trevor)` and Mychal's `dsh (Mychal)`. Do not copy Trevor's agent key files or run the same live
 agent identity on two Harness instances: both can answer the same message. No cross-machine lock exists.
@@ -292,3 +296,20 @@ dsh plugin --profile web add /absolute/path/to/dsh-plugin-buzz     # install a c
 ```
 
 Plain JavaScript, no build step. MIT license.
+
+### DMs and long-running work
+
+Agents publish completed assistant messages while a model is working, including progress text before tools or
+delegated tasks finish. Only visible text is posted, never internal reasoning or tool arguments. Later results are
+posted into the same thread; identical consecutive responses are not posted twice.
+Each channel has its own message subscription, so discovering another DM does not replace an existing subscription.
+Failed model turns produce an error reply directing you to the Harness conversation, even if the model already
+sent progress text. This includes runtime errors that do not produce a final turn record. Those model failure
+replies keep raw provider error details out of the chat, and the conversation is flushed on failure as well as success.
+
+If a DM gets no reply, check the corresponding `session-buzz-*` conversation in Harness: the model may be waiting
+for delegated work. A Harness restart interrupts running work; resend an unfinished request after restarting.
+Thread context survives restarts, but pending requests are not a durable job queue. `buzz_subscription_closed`
+logs include the relay's refusal reason; the listener reconnects and resubscribes from its in-memory cursor.
+`buzz_turn_error` reports reply delivery failures. The `doctor` check
+verifies relay reads, not model execution or delivery of a reply.

@@ -80,11 +80,14 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
   const queues = new Map();           // thread key -> promise chain: one turn at a time per thread
   let since = Math.floor(now() / 1000);
   let ws, closed = false, delay = 1000, authed = false;
+  let connectionSince = since;
+  const subscribeChannel = (channel) => ws.send(JSON.stringify(["REQ", `channel:${channel}`,
+    { kinds: [9], "#h": [channel], since: connectionSince }]));
 
   const subscribe = () => {
     ws.send(JSON.stringify(["REQ", "groups", { kinds: [39000, 39002], "#p": [me] }, { kinds: [39000, 39002], "#d": [...members] }]));
     ws.send(JSON.stringify(["REQ", "mentions", { kinds: [9], "#p": [me], since }]));
-    if (members.size) ws.send(JSON.stringify(["REQ", "channels", { kinds: [9], "#h": [...members], since }]));
+    for (const channel of members) subscribeChannel(channel);
     ws.send(JSON.stringify(["REQ", "membership", { kinds: [44100], "#p": [me], since }]));
   };
   const handle = (e) => {
@@ -103,12 +106,17 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
     const next = prev.then(async () => {
       if (closed) return;
       const t0 = now();
-      let text;
-      try { text = await answer(e.content, { threadKey: r.threadKey, event: e }); }
+      let text, lastPosted;
+      const post = async (text) => {
+        if (closed || !text || text === lastPosted) return;
+        const id = await send({ channel: r.channel, replyTo: r.replyTo, mention: e.pubkey, text });
+        if (id) remember(id, r.threadKey);
+        lastPosted = text;
+      };
+      try { text = await answer(e.content, { threadKey: r.threadKey, event: e, onProgress: post }); }
       catch (err) { text = `(${name} could not answer: ${String(err?.message || err).slice(0, 300)})`; }
       if (closed) return;
-      const id = await send({ channel: r.channel, replyTo: r.replyTo, mention: e.pubkey, text: text || "(no answer)" });
-      if (id) remember(id, r.threadKey);
+      await post(text || "(no answer)");
       log({ event: "buzz_turn", agent: name, thread: r.threadKey.slice(0, 12), ms: now() - t0, chars: (text || "").length });
     }).catch((err) => log({ event: "buzz_turn_error", agent: name, error: String(err?.message || err).slice(0, 200) }));
     queues.set(r.threadKey, next);
@@ -133,7 +141,7 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
           // one other is treated as a DM, so every message there is for it.
           if (isDm(tagValues(e, "p"), me)) dmChannels.add(d);
           else dmChannels.delete(d);
-          if (!members.has(d)) { members.add(d); if (authed) ws.send(JSON.stringify(["REQ", "channels", { kinds: [9], "#h": [...members], since }])); }
+          if (!members.has(d)) { members.add(d); if (authed) subscribeChannel(d); }
         }
         if (e.kind === 39000 && (e.tags || []).some((t) => t[0] === "hidden" || (t[0] === "t" && t[1] === "dm"))) dmChannels.add(d);
       } else if (e.kind === 44100) {
@@ -141,15 +149,20 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
         // Ask for the new channel's member list first; its 39002 (handled above) marks a DM and only then subscribes to
         // the messages. Subscribing here would let the first message of a new DM arrive before the channel is known
         // to be a DM, and it would be dropped as unaddressed chatter.
-        if (d && !members.has(d)) ws.send(JSON.stringify(["REQ", "groups-new", { kinds: [39000, 39002], "#d": [d] }]));
+        if (d && !members.has(d)) ws.send(JSON.stringify(["REQ", `groups-new:${d}`, { kinds: [39000, 39002], "#d": [d] }]));
       } else handle(e);
-    } else if (m[0] === "CLOSED" && /auth-required/.test(String(m[2] || "")) && !authed) {
-      log({ event: "buzz_waiting_for_auth", agent: name });
+    } else if (m[0] === "CLOSED") {
+      log({ event: "buzz_subscription_closed", agent: name, subscription: m[1], reason: String(m[2] || "").slice(0, 200) });
+      // CLOSED ends this subscription, not the socket. Leaving the connection open
+      // would look healthy while permanently missing that channel's messages.
+      // Reconnect through the existing backoff path and replay from the cursor.
+      try { ws.close(); } catch { /* close may already be in progress */ }
     }
   };
   const open = () => {
     if (closed) return;
     authed = false;
+    connectionSince = since;
     ws = new WebSocketImpl(url);
     ws.addEventListener("message", (ev) => onMessage(ev.data));
     ws.addEventListener("close", () => {
