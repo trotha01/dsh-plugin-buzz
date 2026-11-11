@@ -104,6 +104,17 @@ test("a refused message is an error, not a fake success", async () => {
   assert.match(r.content[0].text, /not a member/);
 });
 
+test("send requires a valid acknowledgement before reporting success", async () => {
+  for (const response of [null, {}, { accepted: true }, { event_id: "bad" }]) {
+    replies["messages send"] = response;
+    const r = await call("buzz_send", { channel: CH, content: "hello" });
+    assert.equal(r.isError, true);
+    assert.match(r.content[0].text, /delivery is unconfirmed/);
+  }
+  replies["messages send"] = { accepted: true, id: EV };
+  assert.equal((await call("buzz_send", { channel: CH, content: "hello" })).content[0].text, `sent. id=${EV}`);
+});
+
 test("buzz_mentions shows each mention once and remembers its place in a 0600 file", async () => {
   replies["feed get"] = [{ id: EV, pubkey: OTHER, created_at: 1794364500, content: "@dsh ping", tags: [["h", CH]] },
                          { id: "d".repeat(64), pubkey: GEN_X, created_at: 1794364600, content: "my own message", tags: [] }];

@@ -174,16 +174,10 @@ Each live agent needs a unique `name` across your plugin rows and its own key. S
         keyFile: /home/ada/.config/buzz/claude.key
         provider: claude-max          # any provider id from dsh's model settings
         model: claude-opus
-      - name: GLM
-        keyFile: /home/ada/.config/buzz/glm.key
-        provider: workers-ai
-        model: "@cf/zai-org/glm-4.7-flash"
-      - name: Codex                   # a model that hands each message to a dsh subagent tool
-        keyFile: /home/ada/.config/buzz/codex.key
-        provider: workers-ai
-        model: "@cf/zai-org/glm-4.7-flash"
-        instructions: "Call the subagent_codex tool once with the message below as the task, unchanged, then reply with its answer word for word."
+
 ```
+
+Once one identity works, add more entries under `agents`, each with its own key and provider/model IDs.
 
 ### Agents talking to agents (loop guard)
 

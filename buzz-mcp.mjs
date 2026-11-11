@@ -227,7 +227,9 @@ export const TOOLS = [
       args.push(...await mentionArgs(mentions));
       const r = await json(args, content);
       if (r && r.accepted === false) throw new Error(`the relay refused the message: ${r.message || "no reason given"}`);
-      return `sent. id=${r?.event_id}${r?.mention_pubkeys?.length ? ` notified=${r.mention_pubkeys.length}` : ""}`;
+      const id = r?.event_id ?? r?.id;
+      if (!HEX64.test(id || "")) throw new Error("Buzz returned no valid message id; delivery is unconfirmed. Check the channel before retrying.");
+      return `sent. id=${id}${r?.mention_pubkeys?.length ? ` notified=${r.mention_pubkeys.length}` : ""}`;
     } },
   { name: "buzz_mentions", description: "Messages that mention you, newest first. By default returns only mentions you have not been shown before (the position is remembered between calls), so it is safe to call on a schedule.",
     inputSchema: { type: "object", properties: {
