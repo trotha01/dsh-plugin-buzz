@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-buzz",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Let dsh agents read and post in Buzz, and put dsh models in Buzz as their own users that answer at once (live relay connection, no polling).",
   "keywords": [
     "agents",
