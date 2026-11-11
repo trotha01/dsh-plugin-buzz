@@ -64,11 +64,11 @@ function keygen(file) {
 
 // ---- the buzz CLI -------------------------------------------------------------------------------------------
 const CLI_PLACES = [join(HERE, "bin", "buzz"), "/Applications/Buzz.app/Contents/Resources/bin/buzz", "/usr/lib/Buzz Foundation/bin/buzz"];
-function cliPath() {
+export function cliPath() {
   if (process.env.BUZZ_CLI) return process.env.BUZZ_CLI;
   return CLI_PLACES.find((p) => existsSync(p)) ?? "buzz";
 }
-function cliEnv(key) {
+export function cliEnv(key) {
   const env = { PATH: process.env.PATH || "/usr/bin:/bin", HOME: process.env.HOME || "/", BUZZ_RELAY_URL: RELAY, BUZZ_PRIVATE_KEY: key };
   // NixOS: the upstream binary is a normal dynamically linked ELF and needs nix-ld. dsh scrubs the environment
   // it gives MCP servers, so set it here when the system has it.
