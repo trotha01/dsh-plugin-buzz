@@ -18,8 +18,14 @@ export function signEvent(secretHex, { kind, tags = [], content = "", created_at
   return { id, pubkey, created_at, kind, tags, content, sig };
 }
 export const verifyEvent = (e) => {
-  const id = bytesToHex(sha256(enc.encode(JSON.stringify([0, e.pubkey, e.created_at, e.kind, e.tags, e.content]))));
-  return id === e.id && schnorr.verify(hexToBytes(e.sig), hexToBytes(e.id), hexToBytes(e.pubkey));
+  try {
+    if (!e || !HEX64.test(e.id) || !HEX64.test(e.pubkey) || !/^[0-9a-f]{128}$/.test(e.sig) ||
+      !Number.isSafeInteger(e.created_at) || e.created_at < 0 || !Number.isSafeInteger(e.kind) ||
+      typeof e.content !== "string" || !Array.isArray(e.tags) ||
+      !e.tags.every(t => Array.isArray(t) && t.every(v => typeof v === "string"))) return false;
+    const id = bytesToHex(sha256(enc.encode(JSON.stringify([0, e.pubkey, e.created_at, e.kind, e.tags, e.content]))));
+    return id === e.id && schnorr.verify(hexToBytes(e.sig), hexToBytes(e.id), hexToBytes(e.pubkey));
+  } catch { return false; }
 };
 
 /** A channel's member list (39002 p tags) makes it a DM when it is this identity plus at most one other. */
@@ -95,18 +101,22 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
     remember(e.id, r.threadKey); remember(r.replyTo, r.threadKey);
     const prev = queues.get(r.threadKey) ?? Promise.resolve();
     const next = prev.then(async () => {
+      if (closed) return;
       const t0 = now();
       let text;
       try { text = await answer(e.content, { threadKey: r.threadKey, event: e }); }
       catch (err) { text = `(${name} could not answer: ${String(err?.message || err).slice(0, 300)})`; }
+      if (closed) return;
       const id = await send({ channel: r.channel, replyTo: r.replyTo, mention: e.pubkey, text: text || "(no answer)" });
       if (id) remember(id, r.threadKey);
       log({ event: "buzz_turn", agent: name, thread: r.threadKey.slice(0, 12), ms: now() - t0, chars: (text || "").length });
     }).catch((err) => log({ event: "buzz_turn_error", agent: name, error: String(err?.message || err).slice(0, 200) }));
     queues.set(r.threadKey, next);
+    void next.finally(() => { if (queues.get(r.threadKey) === next) queues.delete(r.threadKey); });
   };
   const onMessage = (raw) => {
     let m; try { m = JSON.parse(typeof raw === "string" ? raw : raw.toString()); } catch { return; }
+    if (closed || !Array.isArray(m)) return;
     if (m[0] === "AUTH" && typeof m[1] === "string") {
       ws.send(JSON.stringify(["AUTH", signEvent(secretHex, { kind: 22242, tags: [["relay", url], ["challenge", m[1]]] })]));
     } else if (m[0] === "OK" && m[3] !== undefined && !authed) {
@@ -122,6 +132,7 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
           // Buzz DMs are ordinary groups (named "DM", no marker tag): a channel whose only members are this identity and
           // one other is treated as a DM, so every message there is for it.
           if (isDm(tagValues(e, "p"), me)) dmChannels.add(d);
+          else dmChannels.delete(d);
           if (!members.has(d)) { members.add(d); if (authed) ws.send(JSON.stringify(["REQ", "channels", { kinds: [9], "#h": [...members], since }])); }
         }
         if (e.kind === 39000 && (e.tags || []).some((t) => t[0] === "hidden" || (t[0] === "t" && t[1] === "dm"))) dmChannels.add(d);

@@ -207,3 +207,35 @@ test("listen: the first message of a brand-new DM is answered (member list is fe
   assert.deepEqual(got, ["first DM"]);
   conn.close();
 });
+
+test("malformed events return false without throwing, including correctly signed malformed tags", () => {
+  const valid = msg(OWNER, [["p", ME]]);
+  for (const e of [null, {}, { ...valid, sig: "bad" }, { ...valid, pubkey: "bad" },
+    signEvent(OWNER, { kind: 9, tags: [null] }), signEvent(OWNER, { kind: 9, tags: [["p", 42]] })]) {
+    assert.equal(verifyEvent(e), false);
+  }
+});
+
+test("malformed relay frames do not interrupt subsequent messages and closing prevents a pending reply", async () => {
+  let ws;
+  class FakeWS {
+    constructor() { ws = this; this.h = {}; }
+    addEventListener(t, f) { this.h[t] = f; }
+    send() {}
+    close() {}
+    message(data) { this.h.message({ data: JSON.stringify(data) }); }
+  }
+  let finish, started;
+  const ready = new Promise(r => { started = r; });
+  const answer = new Promise(r => { finish = r; });
+  const posted = [];
+  const conn = listen({ name: "A", relayUrl: "https://relay.example", secretHex: AGENT, allowFrom: [OWNER_PK],
+    WebSocketImpl: FakeWS, log: () => {}, answer: () => { started(); return answer; }, send: async r => posted.push(r) });
+  for (const frame of [null, 42, {}, ["EVENT", "m", { tags: null }]]) assert.doesNotThrow(() => ws.message(frame));
+  ws.message(["EVENT", "m", msg(OWNER, [["p", ME]])]);
+  await ready;
+  conn.close();
+  finish("done");
+  await new Promise(r => setImmediate(r));
+  assert.deepEqual(posted, []);
+});

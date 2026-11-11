@@ -8,6 +8,10 @@ import { existsSync, readFileSync } from "node:fs";
 register("data:text/javascript," + encodeURIComponent(`
   const stubs = {
     "@deepseek-ai/schemastery": "const s=()=>new Proxy(function(){},{get:(t,k)=>k==='then'?undefined:s,apply:()=>s()}); export default s();",
+    "@deepseek-ai/dsh-llm": "export const createUserMessage = x => x;",
+    "@deepseek-ai/dsh-agent": "export const installModelSelection = () => {};",
+    "@deepseek-ai/dsh-brand": "export const brandString = x => x;",
+    "@deepseek-ai/dsh-session": "export const SessionSeq = x => x;",
     "@deepseek-ai/dsh-mcp-client": "export const name='mcp-client'; export async function apply(){}",
   };
   export function resolve(spec, ctx, next) { return spec in stubs ? { url: "data:text/javascript," + encodeURIComponent(stubs[spec]), shortCircuit: true } : next(spec, ctx); }
@@ -49,4 +53,59 @@ test("package manifest is a loadable dsh bundle", () => {
   for (const f of ["index.js", "buzz-mcp.mjs", "cordis.patch.yml", "icon.svg"]) assert.ok(pkg.files.includes(f) && existsSync(new URL("../" + f, import.meta.url)));
   assert.match(readFileSync(new URL("../cordis.patch.yml", import.meta.url), "utf8"), new RegExp(`name: ${pkg.name}\\b`));
   assert.equal(name, "buzz");
+});
+
+test("malformed relay URLs are rejected before a listener can start", () => {
+  for (const relayUrl of ["https://", "https://user:secret@relay.example", "wss://relay.example", "https://relay.example/#fragment"]) {
+    assert.equal(typeof resolve({ keyFile: "/k", relayUrl }, {}), "string");
+  }
+});
+
+test("live sender rejects missing CLI and relay refusal instead of reporting success", async () => {
+  const { mkdtempSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { makeSender } = await import("../index.js");
+  const dir = mkdtempSync(join(tmpdir(), "buzz-sender-"));
+  const keyFile = join(dir, "agent.key");
+  writeFileSync(keyFile, "11".repeat(32), { mode: 0o600 });
+  const reply = { channel: "test", replyTo: "ab".repeat(32), text: "hello" };
+  await assert.rejects(makeSender({ relayUrl: "https://relay.example", keyFile, cli: join(dir, "missing") })(reply), /CLI was not found/);
+  const cli = join(dir, "fake-buzz");
+  writeFileSync(cli, `#!${process.execPath}\nconsole.log(JSON.stringify({accepted:false,event_id:'${"ab".repeat(32)}'}));`, { mode: 0o700 });
+  await assert.rejects(makeSender({ relayUrl: "https://relay.example", keyFile, cli })(reply), /refused/);
+  writeFileSync(cli, `#!${process.execPath}\nconsole.log(JSON.stringify({accepted:true,event_id:'${"ab".repeat(32)}'}));`);
+  assert.equal(await makeSender({ relayUrl: "https://relay.example", keyFile, cli })(reply), "ab".repeat(32));
+});
+
+test("duplicate names or keys cannot silently select another agent's identity", async () => {
+  const { mkdtempSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { pubkeyOf } = await import("../buzz-mcp.mjs");
+  const dir = mkdtempSync(join(tmpdir(), "buzz-duplicates-"));
+  const first = join(dir, "first.key"), second = join(dir, "second.key");
+  writeFileSync(first, "11".repeat(32), { mode: 0o600 });
+  writeFileSync(second, "22".repeat(32), { mode: 0o600 });
+  const original = globalThis.WebSocket, sockets = [], warnings = [], logs = [];
+  let dispose;
+  globalThis.WebSocket = class {
+    constructor() { sockets.push(this); }
+    addEventListener() {}
+    close() {}
+  };
+  try {
+    await apply({ logger: () => ({ info: m => logs.push(m), warn: m => warnings.push(m) }),
+      plugin() {}, on: (_, fn) => { dispose = fn; } }, {
+      relayUrl: "https://relay.example", allowFrom: ["33".repeat(32)], agents: [
+        { name: "first", keyFile: first, provider: "p", model: "m" },
+        { name: "first", keyFile: second, provider: "p", model: "m" },
+        { name: "duplicate-key", keyFile: first, provider: "p", model: "m" },
+      ],
+    });
+    assert.equal(sockets.length, 1);
+    assert.equal(warnings.filter(m => m.includes("duplicate agent")).length, 2);
+    assert.ok(logs.some(m => m.includes(pubkeyOf("11".repeat(32)))));
+    assert.ok(!logs.some(m => m.includes(pubkeyOf("22".repeat(32)))));
+  } finally { dispose?.(); globalThis.WebSocket = original; }
 });

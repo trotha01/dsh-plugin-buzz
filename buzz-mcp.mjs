@@ -33,20 +33,38 @@ const NPUB = /^npub1[02-9ac-hj-np-z]{58}$/;
 
 // ---- key handling -------------------------------------------------------------------------------------------
 const B32 = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
-function nsecToHex(s) {                       // bech32 payload only; a wrong checksum shows up as a relay auth error
-  const data = [...s.slice(5, -6)].map((c) => B32.indexOf(c));
-  if (data.includes(-1)) throw new Error("key file: not a valid nsec");
-  let acc = 0n; for (const v of data) acc = (acc << 5n) | BigInt(v);
-  acc >>= BigInt(data.length * 5 - 256);
-  return acc.toString(16).padStart(64, "0");
+function nsecToHex(s) {
+  if (!/^nsec1[02-9ac-hj-np-z]{58}$/.test(s)) throw new Error("key file: not a valid nsec");
+  const data = [...s.slice(5)].map((c) => B32.indexOf(c));
+  const generators = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+  let chk = 1;
+  for (const v of [...[..."nsec"].map(c => c.charCodeAt(0) >> 5), 0,
+    ...[..."nsec"].map(c => c.charCodeAt(0) & 31), ...data]) {
+    const top = chk >>> 25;
+    chk = ((chk & 0x1ffffff) << 5) ^ v;
+    for (let i = 0; i < 5; i++) if ((top >>> i) & 1) chk ^= generators[i];
+  }
+  if (chk !== 1 || (data[51] & 15)) throw new Error("key file: invalid nsec checksum or padding");
+  let acc = 0n; for (const v of data.slice(0, -6)) acc = (acc << 5n) | BigInt(v);
+  return (acc >> 4n).toString(16).padStart(64, "0");
+}
+
+export function validateRelay(value) {
+  try {
+    const u = new URL(value);
+    if (!["http:", "https:"].includes(u.protocol) || !u.hostname || u.username || u.password || u.hash) throw new Error();
+  } catch { throw new Error("relayUrl must be a valid http:// or https:// URL without credentials or a fragment"); }
+  return value;
 }
 export function readKey(file) {
   if (!file) throw new Error("BUZZ_KEY_FILE is not set");
   const st = statSync(file);
+  if (!st.isFile()) throw new Error(`${file}: expected a regular key file`);
   if (st.mode & 0o077) throw new Error(`${file} is readable by others; run: chmod 600 ${file}`);
   const raw = readFileSync(file, "utf8").trim().split(/\s+/).pop();     // also accepts "Secret key: <hex>"
   const hex = raw.startsWith("nsec1") ? nsecToHex(raw) : raw.toLowerCase();
   if (!HEX64.test(hex)) throw new Error(`${file}: expected a 64-character hex key or an nsec1... key`);
+  try { pubkeyOf(hex); } catch { throw new Error(`${file}: key is outside the valid secp256k1 range`); }
   return hex;
 }
 export function pubkeyOf(hex) {
@@ -81,6 +99,7 @@ export function cliEnv(key) {
 }
 let runCli = (args, stdin) => new Promise((resolve, reject) => {
   if (!RELAY) throw new Error("BUZZ_RELAY_URL is not set (the address of your Buzz relay)");
+  validateRelay(RELAY);
   const key = readKey(process.env.BUZZ_KEY_FILE);
   const child = execFile(cliPath(), ["--format", "agent", ...args], { env: cliEnv(key), timeout: 45_000, maxBuffer: 8 << 20 },
     (err, stdout, stderr) => {
@@ -255,15 +274,29 @@ export async function handle(msg) {
   return { jsonrpc: "2.0", id, error: { code: -32601, message: `method not found: ${method}` } };
 }
 
+export async function doctor() {
+  validateRelay(RELAY);
+  const pubkey = pubkeyOf(readKey(process.env.BUZZ_KEY_FILE));
+  const visible = await json(["channels", "list"]);
+  const joined = await json(["channels", "list", "--member"]);
+  if (!Array.isArray(visible) || !Array.isArray(joined)) throw new Error("unexpected Buzz CLI channel response; check your CLI version");
+  return { ok: true, pubkey, relay: RELAY, cli: cliPath(), visibleChannels: visible.length,
+    joinedChannels: joined.map(c => ({ id: c.channel_id, name: c.name })),
+    next: joined.length ? "Relay reads passed. Open a new dsh session and ask for buzz_whoami and buzz_channels. Live replies also need agents, allowFrom and a working model." :
+      "Relay reads passed, but this identity has joined no channels. Run cli channels join --channel CHANNEL_ID, then repeat doctor." };
+}
+
 async function main() {
   const [mode, ...rest] = process.argv.slice(2);
+  if (mode === "doctor") return void console.log(JSON.stringify(await doctor(), null, 2));
   if (mode === "keygen") return void console.log(keygen(rest[0]));
   if (mode === "pubkey") return void console.log(pubkeyOf(readKey(process.env.BUZZ_KEY_FILE)));
   if (mode === "cli") {
     const key = readKey(process.env.BUZZ_KEY_FILE);
     const child = execFile(cliPath(), rest, { env: cliEnv(key), maxBuffer: 8 << 20 }, (err, out, errOut) => {
-      process.stdout.write(out); process.stderr.write(errOut.split(key).join("<key>")); process.exitCode = err ? (typeof err.code === "number" ? err.code : 1) : 0;
+      process.stdout.write(out.split(key).join("<key>")); process.stderr.write((errOut || err?.message || "").split(key).join("<key>")); process.exitCode = err ? (typeof err.code === "number" ? err.code : 1) : 0;
     });
+    child.stdin.on("error", () => {});
     process.stdin.isTTY ? child.stdin.end() : process.stdin.pipe(child.stdin);
     return;
   }

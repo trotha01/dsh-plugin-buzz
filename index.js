@@ -8,7 +8,7 @@ import { readFileSync, writeFileSync, renameSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import Schema from '@deepseek-ai/schemastery'
 import * as mcpClient from '@deepseek-ai/dsh-mcp-client'
-import { readKey, pubkeyOf, cliPath, cliEnv } from './buzz-mcp.mjs'
+import { readKey, pubkeyOf, cliPath, cliEnv, validateRelay } from './buzz-mcp.mjs'
 import { listen } from './listen.mjs'
 import { makeAnswerer } from './agent-turn.mjs'
 
@@ -46,7 +46,7 @@ export function resolve(config = {}, env = process.env) {
   const cliPath = config.cliPath || env.BUZZ_CLI || ''
   if (!keyFile) return 'no key file: set BUZZ_KEY_FILE (or keyFile in the row config) to the agent\'s key file'
   if (!relayUrl) return 'no relay: set BUZZ_RELAY_URL (or relayUrl in the row config) to your Buzz relay address'
-  if (!/^https?:\/\//.test(relayUrl)) return `relayUrl must start with http:// or https:// (got ${relayUrl})`
+  try { validateRelay(relayUrl) } catch (e) { return e.message }
   const childEnv = { BUZZ_KEY_FILE: keyFile, BUZZ_RELAY_URL: relayUrl }
   if (cliPath) childEnv.BUZZ_CLI = cliPath
   return {
@@ -67,16 +67,21 @@ export function threadStore(keyFile) {
   }
 }
 
-/** Post a reply as one identity through the buzz CLI; resolves to the new message id (or undefined). */
+/** Post a reply as one identity through the buzz CLI; resolves to the new message id; rejects failed or refused sends. */
 export function makeSender({ relayUrl, keyFile, cli }) {
-  return ({ channel, replyTo, mention, text }) => new Promise((resolve) => {
+  return ({ channel, replyTo, mention, text }) => new Promise((resolve, reject) => {
     const key = readKey(keyFile)
     const env = { ...cliEnv(key), BUZZ_RELAY_URL: relayUrl }
     const args = ['--format', 'agent', 'messages', 'send', '--channel', channel, '--content', '-', '--reply-to', replyTo]
     if (mention && HEX64.test(mention)) args.push('--mention', mention)
     const child = execFile(cli || cliPath(), args, { env, timeout: 45_000, maxBuffer: 8 << 20 }, (err, out) => {
-      if (err) return resolve(undefined)
-      try { const j = JSON.parse(out); resolve(j?.event_id ?? j?.id) } catch { resolve(undefined) }
+      if (err) return reject(new Error(err.code === 'ENOENT' ? 'the buzz CLI was not found; set cliPath or BUZZ_CLI' : 'Buzz reply failed; check relay access and channel membership'))
+      try {
+        const j = JSON.parse(out)
+        const id = j?.event_id ?? j?.id
+        if (j?.accepted === false || !HEX64.test(id || '')) throw new Error()
+        resolve(id)
+      } catch { reject(new Error('Buzz reply was refused or returned no valid message id; check channel membership')) }
     })
     child.stdin.on('error', () => {})
     child.stdin.end(text)
@@ -90,7 +95,7 @@ async function dshDeps() {
   return { createUserMessage, installModelSelection, brandString, SessionSeq }
 }
 
-export async function apply(ctx, config) {
+export async function apply(ctx, config = {}) {
   const log = ctx.logger?.('buzz')
   const say = (msg) => (log?.info ? log.info(msg) : console.log(`[buzz] ${msg}`))
   const warn = (msg) => (log?.warn ? log.warn(msg) : console.warn(`[buzz] ${msg}`))
@@ -102,23 +107,29 @@ export async function apply(ctx, config) {
   const agents = config.agents || []
   if (!agents.length) return
   const relayUrl = config.relayUrl || process.env.BUZZ_RELAY_URL || ''
-  if (!/^https?:\/\//.test(relayUrl)) return warn('Buzz agents are idle: set relayUrl (https://...)')
+  try { validateRelay(relayUrl) } catch (e) { return warn(`Buzz agents are idle: ${e.message}`) }
   const allowFrom = (config.allowFrom || []).map((s) => s.trim().toLowerCase()).filter((s) => HEX64.test(s))
-  if (!allowFrom.length) warn('Buzz agents answer nobody until allowFrom lists at least one public key')
+  if (!allowFrom.length) warn('Buzz agents answer no humans until allowFrom lists at least one public key')
+  if (allowFrom.length !== (config.allowFrom || []).length) warn('Invalid allowFrom entries ignored: use 64-character hex public keys, not names or npub strings')
   const deps = await dshDeps()
   const cli = config.cliPath || process.env.BUZZ_CLI || ''
   const cwd = config.cwd || process.cwd()
   const live = []
   const keys = new Map()
+  const usedNames = new Set(), usedKeys = new Set()
   for (const a of agents) {
-    try { keys.set(a.name, readKey(a.keyFile)) } catch (e) { warn(`Buzz agent ${a.name} is idle: ${e.message}`) }
+    try {
+      const key = readKey(a.keyFile), pubkey = pubkeyOf(key)
+      if (usedNames.has(a.name) || usedKeys.has(pubkey)) throw new Error('duplicate agent name or key; give each live agent a unique name and key')
+      usedNames.add(a.name); usedKeys.add(pubkey); keys.set(a, key)
+    } catch (e) { warn(`Buzz agent ${a.name} is idle: ${e.message}`) }
   }
   // Own identities may @mention each other; other agents only if listed. Humans in allowFrom are never capped.
   const allowAgents = [...new Set([...(config.allowAgents || []).map((s) => s.trim().toLowerCase()).filter((s) => HEX64.test(s)),
     ...[...keys.values()].map(pubkeyOf)])]
   const maxAgentReplies = Number.isInteger(config.maxAgentReplies) ? config.maxAgentReplies : 5
   for (const a of agents) {
-    const secretHex = keys.get(a.name)
+    const secretHex = keys.get(a)
     if (!secretHex) continue
     const conn = listen({
       name: a.name, relayUrl, secretHex, allowFrom, allowAgents, maxAgentReplies,

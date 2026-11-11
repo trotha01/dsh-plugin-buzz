@@ -125,3 +125,28 @@ test("CLI failures come back as tool errors", async () => {
   assert.match(r.content[0].text, /not a relay member/);
   assert.equal((await handle({ jsonrpc: "2.0", id: 9, method: "tools/call", params: { name: "nope" } })).error.code, -32602);
 });
+
+test("invalid secret scalars and corrupted nsec checksums fail before contacting the relay", () => {
+  for (const key of ["0".repeat(64), "f".repeat(64), "nsec1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqsmhltgq", "nsec1x"]) {
+    writeFileSync(process.env.BUZZ_KEY_FILE, key);
+    assert.throws(() => readKey(process.env.BUZZ_KEY_FILE), /range|nsec/);
+  }
+});
+
+test("doctor checks a key and authenticated channel reads without sending messages", () => {
+  const cli = join(dir, "fake buzz");
+  writeFileSync(cli, `#!${process.execPath}\nconst args = process.argv.slice(2);\nif (args.slice(0,4).join(' ') !== '--format agent channels list') process.exit(9);\nconsole.log(JSON.stringify([{channel_id: '${CH}', name: 'general'}]));\n`, { mode: 0o700 });
+  const env = { ...process.env, BUZZ_CLI: cli, BUZZ_RELAY_URL: "https://relay.example" };
+  const result = spawnSync(process.execPath, [SERVER, "doctor"], { env, encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  const data = JSON.parse(result.stdout);
+  assert.equal(data.pubkey, GEN_X);
+  assert.deepEqual(data.joinedChannels, [{ id: CH, name: "general" }]);
+  assert.ok(!result.stdout.includes(KEY));
+  const missing = spawnSync(process.execPath, [SERVER, "doctor"], { env: { ...env, BUZZ_CLI: join(dir, "missing") }, encoding: "utf8" });
+  assert.equal(missing.status, 1);
+  assert.match(missing.stderr, /CLI was not found/);
+  const badUrl = spawnSync(process.execPath, [SERVER, "doctor"], { env: { ...env, BUZZ_RELAY_URL: "https://" }, encoding: "utf8" });
+  assert.equal(badUrl.status, 1);
+  assert.match(badUrl.stderr, /valid http/);
+});
