@@ -167,7 +167,7 @@ untested.
 ## Develop
 
 ```sh
-node --test test/          # no relay and no buzz binary needed
+node --test test/*.test.mjs          # no relay and no buzz binary needed
 dsh plugin --profile web add /absolute/path/to/dsh-plugin-buzz     # install a checkout
 ```
 

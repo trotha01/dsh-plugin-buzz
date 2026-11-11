@@ -1,4 +1,4 @@
-// node --test test/      (no relay, no buzz binary: the CLI runner is replaced by a fake)
+// node --test test/*.test.mjs      (no relay, no buzz binary: the CLI runner is replaced by a fake)
 import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, chmodSync, readFileSync, statSync, existsSync } from "node:fs";

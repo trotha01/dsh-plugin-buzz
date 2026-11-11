@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-buzz",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Let dsh agents read and post in Buzz channels, each agent as its own Buzz identity.",
   "keywords": ["dsh", "deepseek-harness", "buzz", "nostr", "mcp", "chat", "agents"],
   "icon": "./icon.svg",
@@ -14,7 +14,7 @@
   },
   "bin": { "buzz-mcp": "./buzz-mcp.mjs" },
   "files": ["index.js", "buzz-mcp.mjs", "cordis.patch.yml", "icon.svg", "locale/*.json"],
-  "scripts": { "test": "node --test test/" },
+  "scripts": { "test": "node --test test/*.test.mjs" },
   "engines": { "node": ">=22", "dsh": ">=0.2.2-rc.1" },
   "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
   "peerDependencies": {
