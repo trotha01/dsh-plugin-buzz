@@ -23,8 +23,8 @@ export const Config = Schema.object({
   cliPath: Schema.string().default('').description('Path of the buzz CLI. Default: $BUZZ_CLI, else the copy inside the Buzz desktop app, else buzz on PATH'),
   serverName: Schema.string().default('buzz').description('Tool namespace: tools appear as mcp__<serverName>__buzz_send'),
   allowFrom: Schema.array(Schema.string()).default([]).description('Buzz public keys (64-character hex) whose messages the agents below answer. Empty: they answer nobody'),
-  allowAgents: Schema.array(Schema.string()).default([]).description('Public keys of other agents (e.g. a colleague\'s models) the agents below answer, but only when that agent @mentions them. The agents below always accept each other this way'),
-  maxAgentReplies: Schema.natural().default(5).description('Loop guard: at most this many replies to agents per Buzz thread, per identity'),
+  allowAgents: Schema.array(Schema.string()).default([]).description('Public keys of other agents (e.g. a colleague\'s models) the agents below answer, but when that agent @mentions them or sends a DM. The agents below always accept each other this way'),
+  maxAgentReplies: Schema.natural().default(10).description('Loop guard: replies to agents per Buzz thread, per identity (maximum 10; persists across restarts)'),
   cwd: Schema.string().default('').description('Working directory of the dsh conversations started from Buzz. Default: where dsh runs'),
   agents: Schema.array(Schema.object({
     name: Schema.string().required().description('Label for logs and Session ids, e.g. Claude'),
@@ -128,7 +128,7 @@ export async function apply(ctx, config = {}) {
   // Own identities may @mention each other; other agents only if listed. Humans in allowFrom are never capped.
   const allowAgents = [...new Set([...(config.allowAgents || []).map((s) => s.trim().toLowerCase()).filter((s) => HEX64.test(s)),
     ...[...keys.values()].map(pubkeyOf)])]
-  const maxAgentReplies = Number.isInteger(config.maxAgentReplies) ? config.maxAgentReplies : 5
+  const maxAgentReplies = Number.isInteger(config.maxAgentReplies) ? config.maxAgentReplies : 10
   for (const a of agents) {
     const secretHex = keys.get(a)
     if (!secretHex) continue

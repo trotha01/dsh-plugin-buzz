@@ -64,11 +64,11 @@ test("route: answers the owner's mention, DM and thread reply; ignores others, i
   assert.equal(dm.threadKey, `dm:${CH}`);
 });
 
-test("route: an allowed agent counts only when it @mentions this identity", () => {
+test("route: allowed agents can mention or DM; bare group replies are ignored", () => {
   const base = { me: ME, allowFrom: new Set([OWNER_PK]), allowAgents: new Set([OTHER_PK]), dmChannels: new Set([CH]), threads: new Map([["ab".repeat(32), "t"]]) };
   assert.equal(route(msg(OTHER, [["p", ME]]), base).fromAgent, true);
-  assert.equal(route(msg(OTHER, []), base), null);                                       // DM without mention
-  assert.equal(route(msg(OTHER, [["e", "ab".repeat(32), "", "reply"]]), base), null);    // thread follow-up without mention
+  assert.equal(route(msg(OTHER, []), base).fromAgent, true);                                       // DM without mention
+  assert.equal(route(msg(OTHER, [["e", "ab".repeat(32), "", "reply"]]), { ...base, dmChannels: new Set() }), null);    // thread follow-up without mention
   assert.equal(route(msg(OWNER, [["p", ME]]), base).fromAgent, false);
 });
 
@@ -365,22 +365,38 @@ test('human DMs are acknowledged before model work; receipt failure still runs t
   }
 });
 
-test('automatic replies to agents do not mention them and trigger a reply loop', async () => {
-  let ws;
-  const posts=[];
+test('two agents exchange ten rounds, suppress progress, and retain the cap across restarts', async () => {
+  const sockets = [], counts = [0, 0], posts = [], saved = [{}, {}];
   class FakeWS {
-    constructor(){ws=this;}
-    addEventListener(t,f){if(t==='message')this.message=m=>f({data:JSON.stringify(m)});}
-    send(){} close(){}
+    constructor() { sockets.push(this); }
+    addEventListener(t, f) { if (t === 'message') this.message = m => f({data:JSON.stringify(m)}); }
+    send() {} close() {}
   }
-  const c=listen({name:'Grok',relayUrl:'https://relay.example',secretHex:AGENT,allowFrom:[OWNER_PK],allowAgents:[OTHER_PK],
-    WebSocketImpl:FakeWS,log:()=>{},answer:async()=> 'Acknowledged',send:async r=>posts.push(r)});
+  const secrets = [AGENT, OTHER], keys = [ME, OTHER_PK];
+  const root = 'fa'.repeat(32);
+  const create = i => listen({name:`Agent${i}`,relayUrl:'https://relay.example',secretHex:secrets[i],
+    // Even an agent accidentally included in the human allowlist must be capped.
+    allowFrom:[OWNER_PK, keys[1-i]],allowAgents:[keys[1-i]],maxAgentReplies:100,
+    store:{load:()=>saved[i],save:o=>{saved[i]=o;}},WebSocketImpl:FakeWS,log:()=>{},
+    answer:async (text,{onProgress})=>{counts[i]++;await onProgress('working');return `reply ${counts[i]}`;},
+    send:async r=>{
+      posts.push(r);
+      assert.equal(r.mention,keys[1-i]);
+      const e=msg(secrets[i],[['p',r.mention],['e',r.replyTo,'','root']],r.text);
+      sockets[1-i].message(['EVENT','mentions',e]);
+      return e.id;
+    }});
+  const connections=[create(0),create(1)];
   try {
-    ws.message(['EVENT','mentions',msg(OTHER,[['p',ME]])]);
+    sockets[0].message(['EVENT','mentions',msg(OTHER,[['p',ME],['e',root,'','root']],'start')]);
     await new Promise(r=>setImmediate(r));
-    assert.equal(posts.length,1);
-    assert.equal(posts[0].mention,undefined);
-    const reply=signEvent(AGENT,{kind:9,tags:[['h',CH],['e',posts[0].replyTo,'','reply']],content:posts[0].text});
-    assert.equal(route(reply,{me:OTHER_PK,allowFrom:new Set(),allowAgents:new Set([ME]),dmChannels:new Set([CH]),threads:new Map()}),null);
-  } finally {c.close();}
+    assert.deepEqual(counts,[10,10]);
+    assert.equal(posts.length,20);
+    assert.ok(posts.every(p=>p.text!=='working'));
+    connections[0].close();
+    connections[0]=create(0);
+    sockets[2].message(['EVENT','mentions',msg(OTHER,[['p',ME],['e',root,'','root']],'after restart')]);
+    await new Promise(r=>setImmediate(r));
+    assert.deepEqual(counts,[10,10]);
+  } finally {for(const c of connections)c.close();}
 });
