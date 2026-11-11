@@ -27,11 +27,15 @@ const tagValues = (e, name) => (e.tags || []).filter((t) => t[0] === name).map((
 
 /**
  * Decide whether `me` should answer event `e`, and which thread it belongs to. Pure, for tests.
- * @returns {null | { threadKey: string, replyTo: string, channel: string }}
+ * @returns {null | { threadKey: string, replyTo: string, channel: string, fromAgent: boolean }}
  */
-export function route(e, { me, allowFrom, dmChannels, threads }) {
+export function route(e, { me, allowFrom, allowAgents = new Set(), dmChannels, threads }) {
   if (!e || e.kind !== 9 || e.pubkey === me) return null;
-  if (!allowFrom.has(e.pubkey)) return null;
+  const fromAgent = !allowFrom.has(e.pubkey) && allowAgents.has(e.pubkey);
+  if (!allowFrom.has(e.pubkey) && !fromAgent) return null;
+  // Another agent counts only when it @mentions this one (no DM or thread follow-up), so two agents cannot keep a
+  // thread going by replying to each other's replies; listen() also caps replies to agents per thread.
+  if (fromAgent && !(e.tags || []).some((t) => t[0] === "p" && t[1] === me)) return null;
   const channel = tagValues(e, "h")[0];
   if (!channel) return null;
   const refs = (e.tags || []).filter((t) => t[0] === "e" && HEX64.test(t[1] || ""));
@@ -40,17 +44,19 @@ export function route(e, { me, allowFrom, dmChannels, threads }) {
   if (!mentioned && !known && !dmChannels.has(channel)) return null;
   const root = refs.find((t) => t[3] === "root")?.[1] ?? refs.find((t) => t[3] === "reply")?.[1] ?? refs[0]?.[1];
   const threadKey = known ? threads.get(known) : dmChannels.has(channel) && !root ? `dm:${channel}` : root ?? e.id;
-  return { threadKey, replyTo: root ?? e.id, channel };
+  return { threadKey, replyTo: root ?? e.id, channel, fromAgent };
 }
 
 /**
  * One identity's live connection. `answer(text, ctx)` returns the reply text; `send(reply)` posts it.
  * Reconnects with backoff and resubscribes from the last event seen, so a dropped socket loses nothing.
  */
-export function listen({ name, relayUrl, secretHex, allowFrom, answer, send, log, WebSocketImpl = globalThis.WebSocket, now = () => Date.now() }) {
+export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [], maxAgentReplies = 5, answer, send, log, WebSocketImpl = globalThis.WebSocket, now = () => Date.now() }) {
   const me = bytesToHex(schnorr.getPublicKey(hexToBytes(secretHex)));
   const url = wsUrl(relayUrl);
   const allow = new Set(allowFrom);
+  const agentsAllowed = new Set(allowAgents);
+  const agentReplies = new Map();     // thread key -> replies this identity gave to agents in that thread
   const dmChannels = new Set();
   const members = new Set();
   const threads = new Map();          // event id -> thread key (root, the triggering message, our own replies)
@@ -69,8 +75,13 @@ export function listen({ name, relayUrl, secretHex, allowFrom, answer, send, log
     if (seen.has(e.id)) return;
     seen.add(e.id); if (seen.size > 5000) seen.delete(seen.values().next().value);
     if (e.created_at > since) since = e.created_at;
-    const r = route(e, { me, allowFrom: allow, dmChannels, threads });
+    const r = route(e, { me, allowFrom: allow, allowAgents: agentsAllowed, dmChannels, threads });
     if (!r) return;
+    if (r.fromAgent) {
+      const n = agentReplies.get(r.threadKey) ?? 0;
+      if (n >= maxAgentReplies) return void log({ event: "buzz_agent_cap", agent: name, thread: r.threadKey.slice(0, 12), replies: n });
+      agentReplies.set(r.threadKey, n + 1);
+    }
     threads.set(e.id, r.threadKey); threads.set(r.replyTo, r.threadKey);
     const prev = queues.get(r.threadKey) ?? Promise.resolve();
     const next = prev.then(async () => {

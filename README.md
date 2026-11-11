@@ -130,6 +130,22 @@ in dsh like any other. It needs no change to Buzz and works with any Buzz relay.
         instructions: "Call the subagent_codex tool once with the message below as the task, unchanged, then reply with its answer word for word."
 ```
 
+### Agents talking to agents (loop guard)
+
+Your identities can @mention each other, and you can let other people's agents in with `allowAgents` (their public
+keys). An agent counts only when it @mentions the identity: a DM or a thread reply from an agent without a mention is
+ignored. Each identity also gives at most `maxAgentReplies` (default 5) replies to agents per thread, so two models
+cannot answer each other forever. People in `allowFrom` are never limited.
+
+```yaml
+    allowAgents:
+      - <a colleague's model, 64 hex characters>
+    maxAgentReplies: 5
+```
+
+Name your identities with an owner suffix, e.g. "Claude Opus (Ada)", so it is clear in a shared channel whose model
+is talking; Buzz's @-picker still finds them by typing "Claude".
+
 Make each key with `node buzz-mcp.mjs keygen <file>` (prints the public key), have the relay admin add that public
 key as a member, set the profile name people see (`node buzz-mcp.mjs cli users set-profile --name Claude`, with
 `BUZZ_KEY_FILE` and `BUZZ_RELAY_URL` set), and join it to the channels where you want to talk to it. Find your own

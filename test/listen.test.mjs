@@ -23,7 +23,7 @@ test("signed events verify; a changed event does not; http(s) relay URLs become 
 test("route: answers the owner's mention, DM and thread reply; ignores others, itself and unrelated chatter", () => {
   const base = { me: ME, allowFrom: new Set([OWNER_PK]), dmChannels: new Set(), threads: new Map() };
   const mention = msg(OWNER, [["p", ME]]);
-  assert.deepEqual(route(mention, base), { threadKey: mention.id, replyTo: mention.id, channel: CH });
+  assert.deepEqual(route(mention, base), { threadKey: mention.id, replyTo: mention.id, channel: CH, fromAgent: false });
   assert.equal(route(msg(OTHER, [["p", ME]]), base), null);                 // not in allowFrom
   assert.equal(route(msg(AGENT, [["p", ME]]), base), null);                 // its own message
   assert.equal(route(msg(OWNER, []), base), null);                          // not addressed to it
@@ -32,6 +32,39 @@ test("route: answers the owner's mention, DM and thread reply; ignores others, i
   assert.equal(route(inThread, { ...base, threads }).threadKey, "root-1");  // follow-up without @mention
   const dm = route(msg(OWNER, []), { ...base, dmChannels: new Set([CH]) });
   assert.equal(dm.threadKey, `dm:${CH}`);
+});
+
+test("route: an allowed agent counts only when it @mentions this identity", () => {
+  const base = { me: ME, allowFrom: new Set([OWNER_PK]), allowAgents: new Set([OTHER_PK]), dmChannels: new Set([CH]), threads: new Map([["ab".repeat(32), "t"]]) };
+  assert.equal(route(msg(OTHER, [["p", ME]]), base).fromAgent, true);
+  assert.equal(route(msg(OTHER, []), base), null);                                       // DM without mention
+  assert.equal(route(msg(OTHER, [["e", "ab".repeat(32), "", "reply"]]), base), null);    // thread follow-up without mention
+  assert.equal(route(msg(OWNER, [["p", ME]]), base).fromAgent, false);
+});
+
+test("listen: loop guard caps replies to agents per thread; the owner is never capped", async () => {
+  const sockets = [];
+  class FakeWS {
+    constructor() { this.sent = []; this.h = {}; sockets.push(this); queueMicrotask(() => this.emit("message", { data: JSON.stringify(["AUTH", "c"]) })); }
+    addEventListener(t, f) { (this.h[t] ||= []).push(f); }
+    emit(t, ev) { for (const f of this.h[t] || []) f(ev); }
+    send(s) { this.sent.push(JSON.parse(s)); }
+    close() {}
+  }
+  let answers = 0;
+  const conn = listen({ name: "A", relayUrl: "https://r.example", secretHex: AGENT, allowFrom: [OWNER_PK], allowAgents: [OTHER_PK], maxAgentReplies: 2,
+    WebSocketImpl: FakeWS, answer: async () => { answers++; return "ok"; }, send: async () => undefined, log: () => {} });
+  await new Promise((r) => setTimeout(r, 5));
+  const ws = sockets[0];
+  ws.emit("message", { data: JSON.stringify(["OK", ws.sent[0][1].id, true, ""]) });
+  const root = "ef".repeat(32);
+  for (let i = 0; i < 4; i++) ws.emit("message", { data: JSON.stringify(["EVENT", "m", msg(OTHER, [["p", ME], ["e", root, "", "root"]], `agent ${i}`, 2_000_000_000 + i)]) });
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(answers, 2);
+  for (let i = 0; i < 3; i++) ws.emit("message", { data: JSON.stringify(["EVENT", "m", msg(OWNER, [["p", ME], ["e", root, "", "root"]], `owner ${i}`, 2_000_000_100 + i)]) });
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(answers, 5);
+  conn.close();
 });
 
 test("listen: signs in on the relay's challenge, subscribes, answers a pushed mention once, in its thread", async () => {
