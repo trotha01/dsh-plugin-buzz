@@ -34,6 +34,8 @@ export const Config = Schema.object({
   })).default([]).description('dsh models that live in Buzz as their own users. Mention one, DM it, or reply in its thread: it answers at once'),
 })
 
+const LISTENERS = (globalThis.__dshPluginBuzzListeners ??= new Map())   // pubkey -> live connection, shared across reloads
+
 export const SERVER = fileURLToPath(new URL('./buzz-mcp.mjs', import.meta.url))
 
 /** The MCP client row this plugin mounts, or a string saying what is missing. Pure, for tests. */
@@ -114,8 +116,12 @@ export async function apply(ctx, config) {
       send: makeSender({ relayUrl, keyFile: a.keyFile, cli }),
       log: (o) => say(JSON.stringify(o)),
     })
+    // A config reload can apply this plugin again without disposing the old instance; one listener per identity per
+    // process, or every message is answered twice.
+    LISTENERS.get(conn.me)?.close()
+    LISTENERS.set(conn.me, conn)
     say(`Buzz agent ${a.name} (${a.provider}/${a.model}) listening as ${conn.me}`)
     live.push(conn)
   }
-  ctx.on?.('dispose', () => { for (const c of live) c.close() })
+  ctx.on?.('dispose', () => { for (const c of live) { c.close(); if (LISTENERS.get(c.me) === c) LISTENERS.delete(c.me) } })
 }
