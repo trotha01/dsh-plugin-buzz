@@ -179,3 +179,31 @@ test("agent-turn: stable session id per identity and thread; final text is the l
     { type: "assistant/message", data: { message: { content: [{ type: "text", text: "final" }] } } }];
   assert.equal(finalText({ seq: ev.length, eventAt: (i) => ev[i] }, 0), "final");
 });
+
+test("listen: the first message of a brand-new DM is answered (member list is fetched before the messages)", async () => {
+  const sockets = [];
+  class FakeWS {
+    constructor() { this.sent = []; this.h = {}; sockets.push(this); queueMicrotask(() => this.emit("message", { data: JSON.stringify(["AUTH", "c"]) })); }
+    addEventListener(t, f) { (this.h[t] ||= []).push(f); }
+    emit(t, ev) { for (const f of this.h[t] || []) f(ev); }
+    send(s) { this.sent.push(JSON.parse(s)); }
+    close() {}
+  }
+  const got = [];
+  const conn = listen({ name: "Grok", relayUrl: "https://r.example", secretHex: AGENT, allowFrom: [OWNER_PK], WebSocketImpl: FakeWS,
+    answer: async (t) => { got.push(t); return "ok"; }, send: async () => undefined, log: () => {} });
+  await new Promise((r) => setTimeout(r, 5));
+  const ws = sockets[0];
+  ws.emit("message", { data: JSON.stringify(["OK", ws.sent[0][1].id, true, ""]) });
+  const relay = "44".repeat(32);
+  ws.emit("message", { data: JSON.stringify(["EVENT", "membership", signEvent(relay, { kind: 44100, tags: [["h", CH], ["p", ME]] })]) });
+  const subscribedToCh = () => ws.sent.some((m) => m[0] === "REQ" && m[1] === "channels" && m[2]["#h"].includes(CH));
+  assert.ok(!subscribedToCh(), "no message subscription before the member list");
+  assert.ok(ws.sent.some((m) => m[1] === "groups-new" && m[2]["#d"][0] === CH));
+  ws.emit("message", { data: JSON.stringify(["EVENT", "groups-new", signEvent(relay, { kind: 39002, tags: [["d", CH], ["p", ME], ["p", OWNER_PK]] })]) });
+  assert.ok(subscribedToCh());
+  ws.emit("message", { data: JSON.stringify(["EVENT", "channels", msg(OWNER, [], "first DM")]) });
+  await new Promise((r) => setTimeout(r, 5));
+  assert.deepEqual(got, ["first DM"]);
+  conn.close();
+});

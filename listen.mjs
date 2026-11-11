@@ -127,7 +127,10 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
         if (e.kind === 39000 && (e.tags || []).some((t) => t[0] === "hidden" || (t[0] === "t" && t[1] === "dm"))) dmChannels.add(d);
       } else if (e.kind === 44100) {
         const d = tagValues(e, "h")[0] ?? tagValues(e, "d")[0];
-        if (d && !members.has(d)) { members.add(d); ws.send(JSON.stringify(["REQ", "groups-new", { kinds: [39000, 39002], "#d": [d] }])); ws.send(JSON.stringify(["REQ", "channels", { kinds: [9], "#h": [...members], since }])); }
+        // Ask for the new channel's member list first; its 39002 (handled above) marks a DM and only then subscribes to
+        // the messages. Subscribing here would let the first message of a new DM arrive before the channel is known
+        // to be a DM, and it would be dropped as unaddressed chatter.
+        if (d && !members.has(d)) ws.send(JSON.stringify(["REQ", "groups-new", { kinds: [39000, 39002], "#d": [d] }]));
       } else handle(e);
     } else if (m[0] === "CLOSED" && /auth-required/.test(String(m[2] || "")) && !authed) {
       log({ event: "buzz_waiting_for_auth", agent: name });
