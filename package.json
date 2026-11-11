@@ -1,8 +1,18 @@
 {
   "name": "dsh-plugin-buzz",
-  "version": "0.1.1",
-  "description": "Let dsh agents read and post in Buzz channels, each agent as its own Buzz identity.",
-  "keywords": ["dsh", "deepseek-harness", "buzz", "nostr", "mcp", "chat", "agents"],
+  "version": "0.2.0",
+  "description": "Let dsh agents read and post in Buzz, and put dsh models in Buzz as their own users that answer at once (live relay connection, no polling).",
+  "keywords": [
+    "agents",
+    "buzz",
+    "chat",
+    "deepseek-harness",
+    "dsh",
+    "mcp",
+    "nostr",
+    "push",
+    "websocket"
+  ],
   "icon": "./icon.svg",
   "type": "module",
   "main": "index.js",
@@ -12,15 +22,42 @@
     "./locale/*.json": "./locale/*.json",
     "./package.json": "./package.json"
   },
-  "bin": { "buzz-mcp": "./buzz-mcp.mjs" },
-  "files": ["index.js", "buzz-mcp.mjs", "cordis.patch.yml", "icon.svg", "locale/*.json"],
-  "scripts": { "test": "node --test test/*.test.mjs" },
-  "engines": { "node": ">=22", "dsh": ">=0.2.2-rc.1" },
-  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "bin": {
+    "buzz-mcp": "./buzz-mcp.mjs"
+  },
+  "files": [
+    "index.js",
+    "buzz-mcp.mjs",
+    "listen.mjs",
+    "agent-turn.mjs",
+    "cordis.patch.yml",
+    "icon.svg",
+    "locale/*.json"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=22",
+    "dsh": ">=0.2.2-rc.1"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
   "peerDependencies": {
     "@deepseek-ai/cordis": "*",
     "@deepseek-ai/dsh-mcp-client": "*",
-    "@deepseek-ai/schemastery": "*"
+    "@deepseek-ai/schemastery": "*",
+    "@deepseek-ai/dsh-llm": "*",
+    "@deepseek-ai/dsh-agent": "*",
+    "@deepseek-ai/dsh-brand": "*",
+    "@deepseek-ai/dsh-session": "*"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "@noble/curves": "2.4.0",
+    "@noble/hashes": "2.4.0"
+  }
 }
