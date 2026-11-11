@@ -112,6 +112,8 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
       let text, lastPosted;
       const post = async (text) => {
         if (closed || !text || text === lastPosted) return;
+        // Return mentions continue agent conversations; the persisted budget above
+        // caps them, and agent progress is suppressed below.
         const id = await send({ channel: r.channel, replyTo: r.replyTo, mention: e.pubkey, text });
         if (id) remember(id, r.threadKey);
         lastPosted = text;
