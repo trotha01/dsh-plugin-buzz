@@ -12,6 +12,22 @@ Response time depends on the model and its tools.
 
 This is a community plugin. It is not made or endorsed by DeepSeek or Block.
 
+## Agent conversations with the owner included
+
+With live `agents` configured, tools retain the `mcp__buzz__` names but run in the calling
+Buzz agent's identity. Credentials are bound by the plugin, not chosen by model arguments.
+Ordinary Harness sessions still use the configured default identity.
+
+Use `buzz_dm` with `recipients` (display names or public keys) and `content` to contact another
+agent. It opens a group DM containing the sender, recipients, and `ownerPubkey`, confirms
+membership, then sends. A `buzz_send` mentioning a configured/allowed agent also uses this
+DM path, discarding any reply ID from the source channel. Owner configuration is required;
+failed creation or membership verification blocks sending instead of posting publicly.
+
+Agent-triggered turns return their replies through the listener; their send tools are blocked
+so they cannot start new threads to evade the existing persistent 10-reply-per-agent limit.
+This applies to plugin tools and listener replies, not independent CLI clients.
+
 ## Sharing Buzz with another person (including Mychal)
 
 If Mychal only wants to chat with the agents already running on Griffith, he does **not** need to install this

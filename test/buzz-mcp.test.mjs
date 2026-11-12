@@ -196,3 +196,53 @@ test('MCP blocks sends when owner membership is invalid, unavailable, or additio
     } finally { delete process.env.BUZZ_OWNER_PUBKEY; }
   }
 });
+
+test('agent mention opens an owner-included DM and drops the source reply id', async () => {
+  const {withIdentity} = await import('../buzz-mcp.mjs');
+  const owner = 'a'.repeat(64);
+  replies['dms open'] = {accepted: true, dm_id: CH};
+  replies['channels members'] = [GEN_X, OTHER, owner].map(pubkey => ({pubkey}));
+  const result = await withIdentity({BUZZ_OWNER_PUBKEY: owner, agentPubkeys: [OTHER]}, () =>
+    TOOLS.find(t=>t.name==='buzz_send').run({channel: 'general', content: 'hello', mentions: [OTHER], reply_to: EV}));
+  const opened = calls.find(c=>c.args[0]==='dms');
+  assert.deepEqual(opened.args, ['dms','open','--pubkey',OTHER,'--pubkey',owner]);
+  const sent = calls.find(c=>c.args[0]==='messages');
+  assert.ok(!sent.args.includes('--reply-to'));
+  assert.ok(sent.args.includes(OTHER));
+  assert.match(result, /channel=/);
+  assert.ok(!calls.some(c=>c.args[0]==='channels' && c.args[1]==='list'));
+});
+
+test('DM fails closed on refused creation or missing participants', async () => {
+  const {withIdentity} = await import('../buzz-mcp.mjs');
+  const dm = TOOLS.find(t=>t.name==='buzz_dm');
+  const invoke = () => withIdentity({BUZZ_OWNER_PUBKEY: 'a'.repeat(64)}, () => dm.run({recipients:[OTHER],content:'hello'}));
+  replies['dms open'] = {accepted:false, dm_id:CH};
+  await assert.rejects(invoke(), /refused/);
+  replies['dms open'] = {accepted:true, dm_id:CH};
+  replies['channels members'] = [{pubkey:GEN_X}, {pubkey:OTHER}];
+  await assert.rejects(invoke(), /participants/);
+  assert.ok(!calls.some(c=>c.args[0]==='messages'));
+});
+
+test('agent-triggered turns cannot evade the listener reply cap with tools', async () => {
+  const {withIdentity} = await import('../buzz-mcp.mjs');
+  for (const [name,args] of [['buzz_send',{channel:CH,content:'hello'}],['buzz_dm',{recipients:[OTHER],content:'hello'}]]) {
+    await assert.rejects(withIdentity({replyOnly:true},()=>TOOLS.find(t=>t.name===name).run(args)), /Return your reply/);
+  }
+  assert.ok(!calls.some(c=>['messages','dms'].includes(c.args[0])));
+});
+
+test('concurrent tool executions keep separate identities across awaits', async () => {
+  const {withIdentity} = await import('../buzz-mcp.mjs');
+  const second = join(dir,'second.key');
+  writeFileSync(second,'2'.padStart(64,'0'),{mode:0o600});
+  const who = TOOLS.find(t=>t.name==='buzz_whoami');
+  const [a,b] = await Promise.all([
+    withIdentity({BUZZ_KEY_FILE: join(dir,'a.key')},async()=>{await new Promise(r=>setTimeout(r,10));return who.run();}),
+    withIdentity({BUZZ_KEY_FILE: second},async()=>{await Promise.resolve();return who.run();}),
+  ]);
+  assert.ok(a.includes(GEN_X));
+  assert.ok(b.includes(pubkeyOf('2'.padStart(64,'0'))));
+  assert.ok(!b.includes(GEN_X));
+});

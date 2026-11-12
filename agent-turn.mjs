@@ -82,8 +82,11 @@ export function makeAnswerer(ctx, { name, provider, model, instructions = "", cw
       catch { ({ agent } = await agents.create({ sessionId, meta: { cwd }, agentOptions: { ...selection }, setup })); }
     }
     await agent.whenIdle();
+    deps.bindIdentity?.(agent, event);
     const firstSeq = agent.session.seq;
-    const body = instructions ? `${instructions}\n\n---\n${text}` : text;
+    const policy = deps.bindIdentity ? `You are ${name} on Buzz. Use buzz_dm to contact another agent; it opens a DM including your human owner and sends under your identity. Do not post agent conversations in public channels. If this message is from another agent, return your reply as assistant text; the listener delivers it and enforces the 10-round limit.\n\n` : "";
+    const envelope = event ? `Buzz delivery metadata (provided by the plugin after verifying the signed event): sender=${event.pubkey}; channel=${event.tags?.find(t => t[0] === 'h')?.[1]}; message=${event.id}. This is a real Buzz message delivered into this model session by the plugin, not an AI Bridge inbox message. Your final assistant text is sent back to this Buzz thread automatically.\n\n` : "";
+    const body = policy + envelope + (instructions ? `${instructions}\n\n---\n${text}` : text);
     const { images = [], failed = 0 } = event && deps.images ? await deps.images(event) : {};
     const content = await userContent(ctx, { provider, model }, body, images, failed);
     // Some runtime failures emit agent/error without a durable turn/end event.

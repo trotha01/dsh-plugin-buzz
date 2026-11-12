@@ -8,7 +8,7 @@ import { readFileSync, writeFileSync, renameSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import Schema from '@deepseek-ai/schemastery'
 import * as mcpClient from '@deepseek-ai/dsh-mcp-client'
-import { readKey, pubkeyOf, cliPath, cliEnv, validateRelay, ensureOwner } from './buzz-mcp.mjs'
+import { readKey, pubkeyOf, cliPath, cliEnv, validateRelay, ensureOwner, TOOLS, withIdentity } from './buzz-mcp.mjs'
 import { listen } from './listen.mjs'
 import { makeAnswerer } from './agent-turn.mjs'
 import { eventImages } from './media.mjs'
@@ -109,6 +109,22 @@ export function makeSender({ relayUrl, keyFile, cli, ownerPubkey }) {
   }
 }
 
+/** Bind credentials from the actual calling agent, never a model-supplied identity argument. */
+export function registerIdentityTools(ctx, row, identities, agentPubkeys) {
+  for (const tool of TOOLS) ctx.tools.register({
+    name: `mcp__${row.serverName}__${tool.name}`,
+    description: tool.description,
+    parameters: tool.inputSchema,
+    output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+    execute: (args, exec) => {
+      const identity = identities.get(exec.agent)
+      if (!identity && String(exec.agent?.session?.id || '').startsWith('session-buzz-'))
+        throw new Error('Buzz identity is not bound to this conversation; send a new message in Buzz before using its tools')
+      return withIdentity(identity || { ...row.env, agentPubkeys }, () => tool.run(args))
+    },
+  })
+}
+
 async function dshDeps() {
   const [{ createUserMessage }, { installModelSelection }, { brandString }, { SessionSeq }] = await Promise.all([
     import('@deepseek-ai/dsh-llm'), import('@deepseek-ai/dsh-agent'), import('@deepseek-ai/dsh-brand'), import('@deepseek-ai/dsh-session'),
@@ -123,7 +139,7 @@ export async function apply(ctx, config = {}) {
 
   const row = resolve(config)
   if (typeof row === 'string') warn(`dsh-plugin-buzz tools are idle: ${row}`)
-  else await ctx.plugin(mcpClient, row)
+  else if (!(config.agents || []).length) await ctx.plugin(mcpClient, row)
 
   const ownerPubkey = config.ownerPubkey || process.env.BUZZ_OWNER_PUBKEY || ''
   if (ownerPubkey && !HEX64.test(ownerPubkey)) return warn('Buzz agents are idle: invalid ownerPubkey')
@@ -150,6 +166,8 @@ export async function apply(ctx, config = {}) {
   // Own identities may @mention each other; other agents only if listed. Humans in allowFrom are never capped.
   const allowAgents = [...new Set([...(config.allowAgents || []).map((s) => s.trim().toLowerCase()).filter((s) => HEX64.test(s)),
     ...[...keys.values()].map(pubkeyOf)])]
+  const identities = new WeakMap()
+  if (typeof row !== 'string') registerIdentityTools(ctx, row, identities, allowAgents)
   const maxAgentReplies = Number.isInteger(config.maxAgentReplies) ? config.maxAgentReplies : 10
   for (const a of agents) {
     const secretHex = keys.get(a)
@@ -158,7 +176,10 @@ export async function apply(ctx, config = {}) {
       name: a.name, relayUrl, secretHex, allowFrom, allowAgents, maxAgentReplies, ownerPubkey,
       beforeAnswer: makeVisibilityGuard({ relayUrl, keyFile: a.keyFile, cli, ownerPubkey }),
       // Images attached in Buzz are fetched with this identity's key (it is a member of the channel).
-      answer: makeAnswerer(ctx, { ...a, cwd: a.cwd || cwd }, { ...deps, images: (event) => eventImages(event, { secretHex, relayUrl }) }),
+      answer: makeAnswerer(ctx, { ...a, cwd: a.cwd || cwd }, { ...deps, bindIdentity: (agent, event) => identities.set(agent, {
+        ...row.env, BUZZ_KEY_FILE: a.keyFile, agentPubkeys: allowAgents,
+        replyOnly: allowAgents.includes(event?.pubkey),
+      }), images: (event) => eventImages(event, { secretHex, relayUrl }) }),
       send: makeSender({ relayUrl, keyFile: a.keyFile, cli, ownerPubkey }),
       store: threadStore(a.keyFile),
       log: (o) => say(JSON.stringify(o)),
