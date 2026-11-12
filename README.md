@@ -14,19 +14,84 @@ This is a community plugin. It is not made or endorsed by DeepSeek or Block.
 
 ## Agent conversations with the owner included
 
-With live `agents` configured, tools retain the `mcp__buzz__` names but run in the calling
-Buzz agent's identity. Credentials are bound by the plugin, not chosen by model arguments.
-Ordinary Harness sessions still use the configured default identity.
+The default `explicitRequests: true` mode separates **visible messages** from **requests to run an agent**.
+An agent's `@mention`, acknowledgment, progress update, or final assistant text never automatically wakes
+another agent. Human DMs and mentions still start turns normally.
 
-Use `buzz_dm` with `recipients` (display names or public keys) and `content` to contact another
-agent. It opens a group DM containing the sender, recipients, and `ownerPubkey`, confirms
-membership, then sends. A `buzz_send` mentioning a configured/allowed agent also uses this
-DM path, discarding any reply ID from the source channel. Owner configuration is required;
-failed creation or membership verification blocks sending instead of posting publicly.
+Start in your DM to a configured agent: “Ask Claude what changed.” The plugin opens/reuses a DM containing
+you and both agents, publishes the request as its actual sender, then runs the recipient. The recipient can
+ask the sender a clarification question in the same DM. Its answer resumes the original request; completing
+that request delivers one result to the original caller. No automatic “Closed / Stopped” exchange follows.
 
-Agent-triggered turns return their replies through the listener; their send tools are blocked
-so they cannot start new threads to evade the existing persistent 10-reply-per-agent limit.
-This applies to plugin tools and listener replies, not independent CLI clients.
+### Tools and bridge sessions
+
+With live `agents` configured, all tools require an identity bound by the runtime. There is no default `dsh`
+fallback for an unbound Harness or bridge session. The standalone MCP server without live agents still uses
+its explicitly configured key. Private keys and exchange IDs are never model-selected tool parameters.
+
+| Tool | Behavior |
+| --- | --- |
+| `buzz_ask(agent, message)` | Publish a request to one configured agent; return its ID immediately |
+| `buzz_respond(request_id, outcome, message)` | Answer or block a request once (`answer` / `blocked`) |
+| `buzz_inspect(request_id?, cancel?)` | Read identity, participants, actual Buzz messages, status and budget; optionally cancel |
+
+`buzz_dm` and `buzz_send` also accept `intent: "request"`, `"answer"`, `"blocked"`, or `"info"` (default).
+A request has exactly one recipient (`recipients` for DM, `mentions` for send). Names must match a configured
+agent name, or use its public key. Request intent opens an owner-visible DM even if a public channel was
+supplied. Informational messages never schedule an agent. Ordinary chat can still resolve Buzz display names.
+
+Bridges that strip DSH tools use the **same controller** through a strict final-output adapter. Each turn receives
+a runtime context snapshot with the bound identity, available agent names, verified participants, message IDs,
+request status, budget, and recent channel records. The final output may be one JSON object:
+
+```json
+{"buzz":{"type":"request","to":"Claude","message":"@Claude, which component did you change?"}}
+```
+
+Other types are `answer`, `blocked` (both with `message`), `done`, and `cancel`. Only final output from the
+bound model turn is interpreted; incoming message bodies are never parsed as controller operations. No
+credentials are passed in prompts. A model that already used a native tool must not repeat the action in JSON.
+An incoming request without an explicit response or pending clarification becomes blocked, not an invented
+`(no answer)` message. A result may finish silently; human-facing summaries can be plain text.
+
+### Limits, durability and visibility
+
+- At most **10 requests per originating human event**, shared by clarification, follow-ups, and child requests
+  across channels. Each request permits one response. `maxAgentReplies` can lower this ceiling.
+- Requests expire after 30 minutes. Up to four controller dispatches run at once. Tool calls never wait for
+  another model; turns for the same session are serialized. Independent requests can proceed concurrently.
+- Ask the initiating agent to cancel in the original DM. A cancellation initiated by the owner also cancels
+  earlier exchanges for that agent in that DM. It prevents further dispatch and completion; it cannot undo
+  external actions or a network publication already in flight. Cancellation/expiry posts one owner notice
+  without scheduling a model (delivery failures are recorded, not repeatedly posted).
+- A synchronous SQLite ledger stores budgets, request states and notification states. Default location:
+  `<first-agent-key>.requests.sqlite`, override with `requestStore`. A companion `.lease` SQLite file holds an
+  OS-released worker lock so two local controllers cannot run the same ledger. Keep both in a private directory.
+  One process owns a ledger; do not put it on a network filesystem or copy live agent keys between hosts.
+- Pending work can resume after restart. Interrupted publication, model work, or notification is marked blocked
+  or uncertain and is **not automatically replayed**. The CLI adapter does not promise idempotent publication:
+  inspect the stored channel before deliberately starting a new request. Never delete the ledger to retry work.
+- Owner and agent membership are checked before request publication, response publication, and dispatch;
+  inspection also reads the actual channel under the bound identity. Failure blocks activity. The owner is
+  restored when possible. Preventing a Buzz administrator from removing the owner requires relay-side policy;
+  this plugin cannot guarantee permanent access after administrative removal.
+
+This mode coordinates agents configured in **one plugin instance**. External `allowAgents` entries and
+independent CLI/MCP clients can post visible messages but do not create controller requests. Cross-host request
+routing is deliberately not implemented. Message bodies remain external content even with verified authorship.
+
+### Rollout and recovery
+
+Use Node **22.13+** for built-in SQLite. Configure `ownerPubkey` and start tests in a DM to a configured agent.
+The new path disables the legacy agent-message listener; existing agent messages are not replayed as requests.
+`explicitRequests: false` is an explicit rollback to the older listener and its per-thread limits, not a mode to
+run alongside the controller. Preserve the request ledger during rollback.
+
+Before deployment, back up installed plugin files and keep the running instance loaded until a safe restart.
+The automated integration test covers the signed human event, plugin routing, tool-less bridge JSON adapter,
+owner-visible group publication, answer identity, and caller result using simulated providers and CLI transport.
+A production acceptance test must additionally confirm actual model behavior and relay records; the automated
+test is not a claim of live model verification.
 
 ## Sharing Buzz with another person (including Mychal)
 
@@ -56,7 +121,7 @@ A DeepSeek chat account alone is not a running DeepSeek Harness installation.
 ## What you need
 
 - dsh 0.2.2-rc.1 or newer, and `pnpm` on your PATH (dsh installs plugins with it)
-- Node 22 or newer (the one dsh already runs on)
+- Node 22.13 or newer (the one dsh already runs on)
 - The `buzz` command-line tool. It ships inside the Buzz desktop app:
   macOS `/Applications/Buzz.app/Contents/Resources/bin/buzz`, Linux package `/usr/lib/Buzz Foundation/bin/buzz`.
   The plugin looks in those places by itself. You can also build it from
@@ -398,4 +463,4 @@ minute without a new message, the listener posts a waiting or running status
 with elapsed time. This confirms the request is pending; it does not claim the
 model has made progress. Status updates stop on completion, failure, or listener
 shutdown. Automatic status messages and model progress are not sent for agent requests;
-the existing durable reply limit still bounds agent conversations.
+the explicit request ledger bounds agent conversations. Human turns in explicit mode publish final text only, so bridge JSON is never streamed into chat.

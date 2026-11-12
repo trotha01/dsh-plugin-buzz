@@ -518,3 +518,24 @@ test('owner-inclusive agent DMs retain routing and block model work when owner a
     assert.deepEqual(answers, ['visible']);
   } finally { c.close(); }
 });
+
+test('explicit mode ignores agent mentions and close-outs while still answering the owner', async () => {
+  let ws; const calls=[],sent=[];
+  class FakeWS {
+    constructor(){ws=this;this.h={};}
+    addEventListener(type,fn){this.h[type]=fn;}
+    send(){} close(){}
+    event(e){this.h.message({data:JSON.stringify(['EVENT','messages',e])});}
+  }
+  const c=listen({name:'Claude',relayUrl:'https://relay.example',secretHex:AGENT,
+    allowFrom:[OWNER_PK],allowAgents:[OTHER_PK],explicitRequests:true,WebSocketImpl:FakeWS,
+    log:()=>{},answer:async text=>{calls.push(text);return '';},send:async x=>{sent.push(x);}});
+  try {
+    ws.event(msg(OTHER,[['p',ME]],'@Claude Closed.'));
+    ws.event(msg(OWNER,[['p',ME]],'Ask Grok'));
+    await new Promise(r=>setImmediate(r));
+    assert.deepEqual(calls,['Ask Grok']);
+    assert.equal(sent.length,1); // receipt only; no synthetic '(no answer)' message
+    assert.ok(!sent.some(s=>s.text.includes('no answer')));
+  } finally {c.close();}
+});

@@ -33,13 +33,15 @@
     "media.mjs",
     "cordis.patch.yml",
     "icon.svg",
-    "locale/*.json"
+    "locale/*.json",
+    "requests.mjs",
+    "request-transport.mjs"
   ],
   "scripts": {
     "test": "node --test test/*.test.mjs"
   },
   "engines": {
-    "node": ">=22",
+    "node": ">=22.13",
     "dsh": ">=0.2.2-rc.1"
   },
   "dsh": {
