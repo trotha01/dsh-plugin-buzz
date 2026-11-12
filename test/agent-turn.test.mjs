@@ -106,3 +106,18 @@ test('idle text is published before waiting for children, then child completion 
   assert.equal(await answer('review',{threadKey:'dm:test',onProgress:async text=>progress.push(text)}),'Review complete');
   assert.deepEqual(progress,['Waiting for the review','Review complete']);
 });
+
+test('Buzz identity and verified delivery metadata are set before the model starts', async () => {
+  let bound=false,body;
+  const event={pubkey:'a'.repeat(64),id:'b'.repeat(64),tags:[['h','group-dm']]};
+  const agent={status:'idle',session:{seq:0,eventAt:()=>undefined},whenIdle:async()=>{},followup:message=>{
+    assert.equal(bound,true);body=message.content[0].text;
+  }};
+  const answer=makeAnswerer({get:n=>n==='agents'?{get:()=>agent}:undefined},
+    {name:'Grok',provider:'p',model:'m'}, {brandString:s=>s,createUserMessage:s=>s,SessionSeq:s=>s,
+      bindIdentity:(actual,received)=>{assert.equal(actual,agent);assert.equal(received,event);bound=true;}});
+  await answer('hello',{threadKey:'dm:group-dm',event});
+  assert.match(body,/You are Grok on Buzz/);
+  assert.match(body,/channel=group-dm/);
+  assert.match(body,/not an AI Bridge inbox/);
+});

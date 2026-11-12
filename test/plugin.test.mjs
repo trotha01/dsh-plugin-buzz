@@ -128,3 +128,20 @@ test('live sender never posts when owner cannot be included', async () => {
   await assert.rejects(makeSender({keyFile, cli, relayUrl: 'https://relay.example', ownerPubkey: 'ab'.repeat(32)})({channel: 'test', text: 'secret'}), /not added/);
   assert.equal(existsSync(posted), false);
 });
+
+test('native Buzz tools select the calling agent, not a supplied identity', async () => {
+  const {registerIdentityTools} = await import('../index.js');
+  const {setRunner, pubkeyOf} = await import('../buzz-mcp.mjs');
+  const {mkdtempSync,writeFileSync} = await import('node:fs');
+  const {tmpdir} = await import('node:os');
+  const {join} = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(),'buzz-bind-'));
+  const keyFile = join(dir,'key');
+  writeFileSync(keyFile,'11'.repeat(32),{mode:0o600});
+  setRunner(async()=> '[]');
+  const caller = {}, identities = new WeakMap([[caller,{BUZZ_KEY_FILE:keyFile}]]), tools=[];
+  registerIdentityTools({tools:{register:t=>tools.push(t)}},{serverName:'buzz',env:{BUZZ_KEY_FILE:'/missing'}},identities,[]);
+  const who = tools.find(t=>t.name==='mcp__buzz__buzz_whoami');
+  assert.ok((await who.execute({keyFile:'/wrong'}, {agent:caller})).includes(pubkeyOf('11'.repeat(32))));
+  assert.throws(()=>who.execute({}, {agent:{session:{id:'session-buzz-unbound'}}}), /not bound/);
+});
