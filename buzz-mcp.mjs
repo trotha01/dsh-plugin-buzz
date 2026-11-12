@@ -245,7 +245,7 @@ export const TOOLS = [
     run: async () => {
       const pk = pubkeyOf(readKey(setting("BUZZ_KEY_FILE")));
       await nameOf([pk]);
-      return `You are ${names.get(pk) || "(no display name set)"} on Buzz. Public key: ${pk}. Relay: ${RELAY}`;
+      return `You are ${names.get(pk) || "(no display name set)"} on Buzz. Public key: ${pk}. Relay: ${setting("BUZZ_RELAY_URL") || RELAY}`;
     } },
   { name: "buzz_channels", description: "List the Buzz channels you can see, with name, UUID and whether you are a member. You can only post in channels you are a member of (see buzz_join).",
     inputSchema: { type: "object", properties: {} },
