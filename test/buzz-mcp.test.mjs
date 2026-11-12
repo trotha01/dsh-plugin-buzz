@@ -161,3 +161,38 @@ test("doctor checks a key and authenticated channel reads without sending messag
   assert.equal(badUrl.status, 1);
   assert.match(badUrl.stderr, /valid http/);
 });
+
+test('owner is added and confirmed before MCP sends, and removal is rechecked', async () => {
+  process.env.BUZZ_OWNER_PUBKEY = OTHER;
+  let members = [], adds = 0, sends = 0;
+  setRunner(async args => {
+    const op = args.slice(0, 2).join(' ');
+    if (op === 'channels members') return JSON.stringify(members);
+    if (op === 'channels add-member') { adds++; members = [{pubkey: OTHER}]; return '{}'; }
+    if (op === 'messages send') { assert.ok(members.some(m => m.pubkey === OTHER)); sends++; return JSON.stringify({event_id: EV}); }
+    throw new Error(op);
+  });
+  try {
+    assert.ok(!(await call('buzz_send', {channel: CH, content: 'first'})).isError);
+    members = [];
+    assert.ok(!(await call('buzz_send', {channel: CH, content: 'second'})).isError);
+    assert.equal(adds, 2); assert.equal(sends, 2);
+  } finally { delete process.env.BUZZ_OWNER_PUBKEY; }
+});
+
+test('MCP blocks sends when owner membership is invalid, unavailable, or addition is unconfirmed', async () => {
+  for (const mode of ['invalid-key', 'malformed', 'refused', 'unconfirmed']) {
+    process.env.BUZZ_OWNER_PUBKEY = mode === 'invalid-key' ? 'bad' : OTHER;
+    let sends = 0;
+    setRunner(async args => {
+      const op = args.slice(0, 2).join(' ');
+      if (op === 'channels members') return mode === 'malformed' ? '{}' : '[]';
+      if (op === 'channels add-member') { if (mode === 'refused') throw new Error('not permitted'); return '{}'; }
+      sends++; return JSON.stringify({event_id: EV});
+    });
+    try {
+      assert.equal((await call('buzz_send', {channel: CH, content: 'private'})).isError, true);
+      assert.equal(sends, 0);
+    } finally { delete process.env.BUZZ_OWNER_PUBKEY; }
+  }
+});

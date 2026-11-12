@@ -115,6 +115,21 @@ let runCli = (args, stdin) => new Promise((resolve, reject) => {
 export function setRunner(fn) { runCli = fn; }                           // tests
 const json = async (args, stdin) => { const out = (await runCli(args, stdin)).trim(); return out ? JSON.parse(out) : null; };
 
+/** Confirm the owner can read the original conversation before delivering any agent text.
+ * Never cache membership: removal must take effect on the very next send. */
+export async function ensureOwner(channel, owner, request = json) {
+  if (!owner) return;
+  if (!HEX64.test(owner)) throw new Error("ownerPubkey must be a 64-character hex public key");
+  const containsOwner = async () => {
+    const members = await request(["channels", "members", "--channel", channel]);
+    if (!Array.isArray(members)) throw new Error("Cannot confirm conversation owner membership; message blocked");
+    return members.some(m => m.pubkey === owner);
+  };
+  if (await containsOwner()) return;
+  await request(["channels", "add-member", "--channel", channel, "--pubkey", owner]);
+  if (!await containsOwner()) throw new Error("Conversation owner was not added; message blocked");
+}
+
 // ---- helpers ------------------------------------------------------------------------------------------------
 const names = new Map();                                                 // pubkey -> display name
 async function nameOf(pubkeys) {
@@ -222,7 +237,9 @@ export const TOOLS = [
       mentions: { type: "array", items: { type: "string" }, description: "Optional: display names or public keys of the people or agents to notify" } }, required: ["channel", "content"] },
     run: async ({ channel, content, reply_to, mentions }) => {
       if (typeof content !== "string" || !content.trim()) throw new Error("content is empty");
-      const args = ["messages", "send", "--channel", await channelId(channel), "--content", "-"];
+      const idChannel = await channelId(channel);
+      await ensureOwner(idChannel, process.env.BUZZ_OWNER_PUBKEY);
+      const args = ["messages", "send", "--channel", idChannel, "--content", "-"];
       if (reply_to) { if (!HEX64.test(String(reply_to))) throw new Error("reply_to must be a 64-character message id"); args.push("--reply-to", reply_to); }
       args.push(...await mentionArgs(mentions));
       const r = await json(args, content);

@@ -109,3 +109,22 @@ test("duplicate names or keys cannot silently select another agent's identity", 
     assert.ok(!logs.some(m => m.includes(pubkeyOf("22".repeat(32)))));
   } finally { dispose?.(); globalThis.WebSocket = original; }
 });
+
+test('owner configuration reaches MCP and invalid owners disable the row', () => {
+  const config = {keyFile: '/key', relayUrl: 'https://relay.example', ownerPubkey: 'ab'.repeat(32)};
+  assert.equal(resolve(config, {}).env.BUZZ_OWNER_PUBKEY, config.ownerPubkey);
+  assert.match(resolve({...config, ownerPubkey: 'invalid'}, {}), /ownerPubkey/);
+});
+
+test('live sender never posts when owner cannot be included', async () => {
+  const {mkdtempSync, writeFileSync} = await import('node:fs');
+  const {tmpdir} = await import('node:os');
+  const {join} = await import('node:path');
+  const {makeSender} = await import('../index.js');
+  const dir = mkdtempSync(join(tmpdir(), 'buzz-owner-'));
+  const keyFile = join(dir, 'key'), cli = join(dir, 'cli'), posted = join(dir, 'posted');
+  writeFileSync(keyFile, '11'.repeat(32), {mode: 0o600});
+  writeFileSync(cli, `#!${process.execPath}\nimport{writeFileSync}from'node:fs'; if(process.argv.includes('messages'))writeFileSync(${JSON.stringify(posted)},'posted');console.log('[]');`, {mode: 0o700});
+  await assert.rejects(makeSender({keyFile, cli, relayUrl: 'https://relay.example', ownerPubkey: 'ab'.repeat(32)})({channel: 'test', text: 'secret'}), /not added/);
+  assert.equal(existsSync(posted), false);
+});

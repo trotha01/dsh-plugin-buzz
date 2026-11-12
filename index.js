@@ -8,7 +8,7 @@ import { readFileSync, writeFileSync, renameSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import Schema from '@deepseek-ai/schemastery'
 import * as mcpClient from '@deepseek-ai/dsh-mcp-client'
-import { readKey, pubkeyOf, cliPath, cliEnv, validateRelay } from './buzz-mcp.mjs'
+import { readKey, pubkeyOf, cliPath, cliEnv, validateRelay, ensureOwner } from './buzz-mcp.mjs'
 import { listen } from './listen.mjs'
 import { makeAnswerer } from './agent-turn.mjs'
 
@@ -22,6 +22,7 @@ export const Config = Schema.object({
   relayUrl: Schema.string().default('').description('Your Buzz relay, e.g. https://buzz.example.com. Default: $BUZZ_RELAY_URL'),
   cliPath: Schema.string().default('').description('Path of the buzz CLI. Default: $BUZZ_CLI, else the copy inside the Buzz desktop app, else buzz on PATH'),
   serverName: Schema.string().default('buzz').description('Tool namespace: tools appear as mcp__<serverName>__buzz_send'),
+  ownerPubkey: Schema.string().default('').description('Human owner public key. Added to every conversation before agent messages are sent; sends fail closed if membership cannot be confirmed. Default: $BUZZ_OWNER_PUBKEY'),
   allowFrom: Schema.array(Schema.string()).default([]).description('Buzz public keys (64-character hex) whose messages the agents below answer. Empty: they answer nobody'),
   allowAgents: Schema.array(Schema.string()).default([]).description('Public keys of other agents (e.g. a colleague\'s models) the agents below answer, but when that agent @mentions them or sends a DM. The agents below always accept each other this way'),
   maxAgentReplies: Schema.natural().default(10).description('Loop guard: replies to agents per Buzz thread, per identity (maximum 10; persists across restarts)'),
@@ -49,6 +50,9 @@ export function resolve(config = {}, env = process.env) {
   if (!relayUrl) return 'no relay: set BUZZ_RELAY_URL (or relayUrl in the row config) to your Buzz relay address'
   try { validateRelay(relayUrl) } catch (e) { return e.message }
   const childEnv = { BUZZ_KEY_FILE: keyFile, BUZZ_RELAY_URL: relayUrl }
+  const owner = config.ownerPubkey || env.BUZZ_OWNER_PUBKEY || ''
+  if (owner && !HEX64.test(owner)) return 'ownerPubkey must be a 64-character hex public key'
+  if (owner) childEnv.BUZZ_OWNER_PUBKEY = owner
   if (cliPath) childEnv.BUZZ_CLI = cliPath
   return {
     serverName: config.serverName || 'buzz',
@@ -68,25 +72,40 @@ export function threadStore(keyFile) {
   }
 }
 
-/** Post a reply as one identity through the buzz CLI; resolves to the new message id; rejects failed or refused sends. */
-export function makeSender({ relayUrl, keyFile, cli }) {
-  return ({ channel, replyTo, mention, text }) => new Promise((resolve, reject) => {
-    const key = readKey(keyFile)
-    const env = { ...cliEnv(key), BUZZ_RELAY_URL: relayUrl }
-    const args = ['--format', 'agent', 'messages', 'send', '--channel', channel, '--content', '-', '--reply-to', replyTo]
-    if (mention && HEX64.test(mention)) args.push('--mention', mention)
-    const child = execFile(cli || cliPath(), args, { env, timeout: 45_000, maxBuffer: 8 << 20 }, (err, out) => {
-      if (err) return reject(new Error(err.code === 'ENOENT' ? 'the buzz CLI was not found; set cliPath or BUZZ_CLI' : 'Buzz reply failed; check relay access and channel membership'))
-      try {
-        const j = JSON.parse(out)
-        const id = j?.event_id ?? j?.id
-        if (j?.accepted === false || !HEX64.test(id || '')) throw new Error()
-        resolve(id)
-      } catch { reject(new Error('Buzz reply was refused or returned no valid message id; check channel membership')) }
+/** Check owner membership using the sending identity, without exposing its secret key. */
+export function makeVisibilityGuard({ relayUrl, keyFile, cli, ownerPubkey }) {
+  return channel => ensureOwner(channel, ownerPubkey, args => new Promise((resolve, reject) => {
+    execFile(cli || cliPath(), ['--format', 'agent', ...args], {
+      env: { ...cliEnv(readKey(keyFile)), BUZZ_RELAY_URL: relayUrl }, timeout: 45_000, maxBuffer: 8 << 20,
+    }, (err, out) => {
+      if (err) return reject(new Error('Cannot include conversation owner; Buzz message blocked'))
+      try { resolve(JSON.parse(out)) } catch { reject(new Error('Cannot verify conversation owner; Buzz message blocked')) }
     })
-    child.stdin.on('error', () => {})
-    child.stdin.end(text)
-  })
+  }))
+}
+
+export function makeSender({ relayUrl, keyFile, cli, ownerPubkey }) {
+  const guard = makeVisibilityGuard({ relayUrl, keyFile, cli, ownerPubkey })
+  return async ({ channel, replyTo, mention, text }) => {
+    await guard(channel)
+    return new Promise((resolve, reject) => {
+      const key = readKey(keyFile)
+      const env = { ...cliEnv(key), BUZZ_RELAY_URL: relayUrl }
+      const args = ['--format', 'agent', 'messages', 'send', '--channel', channel, '--content', '-', '--reply-to', replyTo]
+      if (mention && HEX64.test(mention)) args.push('--mention', mention)
+      const child = execFile(cli || cliPath(), args, { env, timeout: 45_000, maxBuffer: 8 << 20 }, (err, out) => {
+        if (err) return reject(new Error(err.code === 'ENOENT' ? 'the buzz CLI was not found; set cliPath or BUZZ_CLI' : 'Buzz reply failed; check relay access and channel membership'))
+        try {
+          const j = JSON.parse(out)
+          const id = j?.event_id ?? j?.id
+          if (j?.accepted === false || !HEX64.test(id || '')) throw new Error()
+          resolve(id)
+        } catch { reject(new Error('Buzz reply was refused or returned no valid message id; check channel membership')) }
+      })
+      child.stdin.on('error', () => {})
+      child.stdin.end(text)
+    })
+  }
 }
 
 async function dshDeps() {
@@ -105,6 +124,8 @@ export async function apply(ctx, config = {}) {
   if (typeof row === 'string') warn(`dsh-plugin-buzz tools are idle: ${row}`)
   else await ctx.plugin(mcpClient, row)
 
+  const ownerPubkey = config.ownerPubkey || process.env.BUZZ_OWNER_PUBKEY || ''
+  if (ownerPubkey && !HEX64.test(ownerPubkey)) return warn('Buzz agents are idle: invalid ownerPubkey')
   const agents = config.agents || []
   if (!agents.length) return
   const relayUrl = config.relayUrl || process.env.BUZZ_RELAY_URL || ''
@@ -133,9 +154,10 @@ export async function apply(ctx, config = {}) {
     const secretHex = keys.get(a)
     if (!secretHex) continue
     const conn = listen({
-      name: a.name, relayUrl, secretHex, allowFrom, allowAgents, maxAgentReplies,
+      name: a.name, relayUrl, secretHex, allowFrom, allowAgents, maxAgentReplies, ownerPubkey,
+      beforeAnswer: makeVisibilityGuard({ relayUrl, keyFile: a.keyFile, cli, ownerPubkey }),
       answer: makeAnswerer(ctx, { ...a, cwd: a.cwd || cwd }, deps),
-      send: makeSender({ relayUrl, keyFile: a.keyFile, cli }),
+      send: makeSender({ relayUrl, keyFile: a.keyFile, cli, ownerPubkey }),
       store: threadStore(a.keyFile),
       log: (o) => say(JSON.stringify(o)),
     })
