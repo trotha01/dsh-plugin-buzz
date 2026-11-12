@@ -73,7 +73,7 @@ export function makeAnswerer(ctx, { name, provider, model, instructions = "", cw
     deps.installModelSelection(agentCtx);
   };
   const queues = new Map();
-  const answer = async (text, { threadKey, onProgress, event, requestContext, runtimePrompt, beforeTurn }) => {
+  const answer = async (text, { threadKey, onProgress, event, requestContext, runtimePrompt, beforeTurn, sessionTopic }) => {
     const agents = ctx.get("agents");
     if (!agents) throw new Error("dsh agents service is not available");
     const sessionId = deps.brandString(sessionIdFor(name, threadKey));
@@ -84,6 +84,17 @@ export function makeAnswerer(ctx, { name, provider, model, instructions = "", cw
     }
     await agent.whenIdle();
     await beforeTurn?.();
+    // Use the title service so automatic title generation cannot replace the task title.
+    // Preserve deliberate user renames and existing task titles. Old automatic titles
+    // are repaired on the next turn, without rewriting history or splitting the session.
+    const titles = ctx.get("sessionTitle");
+    if (titles) {
+      const current = titles.get(agent.session);
+      if (!current || current.source?.kind !== "user") {
+        const topic = String(sessionTopic || text || "Agent request").replace(/[\s\p{Cc}\p{Cf}]+/gu, " ").trim();
+        titles.rename(agent.session, Array.from(topic).slice(0, 80).join("") || "Task");
+      }
+    }
     deps.bindIdentity?.(agent, event, requestContext);
     const firstSeq = agent.session.seq;
     const policy = deps.bindIdentity ? `You are ${name} on Buzz. Use buzz_dm to contact another agent; it opens a DM including your human owner and sends under your identity. Do not post agent conversations in public channels. If this message is from another agent, return your reply as assistant text; the listener delivers it and enforces the 10-round limit.\n\n` : "";
