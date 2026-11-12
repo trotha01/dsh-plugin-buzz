@@ -145,3 +145,48 @@ test('native Buzz tools select the calling agent, not a supplied identity', asyn
   assert.ok((await who.execute({keyFile:'/wrong'}, {agent:caller})).includes(pubkeyOf('11'.repeat(32))));
   assert.throws(()=>who.execute({}, {agent:{session:{id:'session-buzz-unbound'}}}), /not bound/);
 });
+
+test('plugin bridge path opens an owner-visible request and routes structured answers without tools',async()=>{
+  const {mkdtempSync,writeFileSync,rmSync}=await import('node:fs');
+  const {tmpdir}=await import('node:os');const {join}=await import('node:path');
+  const {setRunner,pubkeyOf}=await import('../buzz-mcp.mjs');const {signEvent}=await import('../listen.mjs');
+  const dir=mkdtempSync(join(tmpdir(),'buzz-plugin-request-'));
+  const ownerKey='33'.repeat(32),owner=pubkeyOf(ownerKey),grok=pubkeyOf('11'.repeat(32)),claude=pubkeyOf('22'.repeat(32));
+  const channel='a6f725b6-ce62-477e-bb7c-3b041b00a32f';
+  const agents=[['Grok','11'.repeat(32)],['Claude','22'.repeat(32)]].map(([name,key])=>{
+    const keyFile=join(dir,name);writeFileSync(keyFile,key,{mode:0o600});return {name,keyFile,provider:'bridge',model:name};
+  });
+  const cli=join(dir,'cli');writeFileSync(cli,`#!${process.execPath}\nconsole.log(JSON.stringify(process.argv.includes('members')?[{pubkey:'${owner}'}]:{event_id:'${'ab'.repeat(32)}'}));`,{mode:0o700});
+  const posts=[],prompts=[],registered=[],sockets=[];let dispose;
+  setRunner(async(args,text)=>{
+    if(args[0]==='dms')return JSON.stringify({channel_id:channel});
+    if(args[1]==='members')return JSON.stringify([grok,claude,owner].map(pubkey=>({pubkey})));
+    if(args[1]==='send'){posts.push(text);return JSON.stringify({event_id:String(posts.length).padStart(64,'0')});}
+    return '[]';
+  });
+  const sessions=new Map();
+  const service={get:id=>sessions.get(id),resume:async()=>{throw Error('new');},create:async({sessionId})=>{
+    const events=[];const agent={status:'idle',session:{get seq(){return events.length;},eventAt:i=>events[i]},whenIdle:async()=>{},
+      followup:message=>{
+        const prompt=message.content[0].text;prompts.push(prompt);
+        const text=prompt.includes('"kind":"human"')?JSON.stringify({buzz:{type:'request',to:'Claude',message:'What changed?'}}):
+          prompt.includes('"kind":"request"')?JSON.stringify({buzz:{type:'answer',message:'Buzz changed.'}}):'Claude changed Buzz.';
+        events.push({type:'assistant/message',data:{message:{content:[{type:'text',text}]}}});
+      }};sessions.set(sessionId,agent);return {agent};
+  }};
+  const original=globalThis.WebSocket;
+  globalThis.WebSocket=class{constructor(){this.h={};sockets.push(this);}addEventListener(t,f){this.h[t]=f;}send(){}close(){}};
+  try{
+    await apply({tools:{register:t=>registered.push(t)},get:n=>n==='agents'?service:undefined,
+      logger:()=>({info(){},warn(){}}),on:(name,fn)=>{if(name==='dispose')dispose=fn;return ()=>{};}},
+      {keyFile:agents[0].keyFile,relayUrl:'https://relay.example',ownerPubkey:owner,allowFrom:[owner],agents,cliPath:cli});
+    const e=signEvent(ownerKey,{kind:9,tags:[['h',channel],['p',grok]],content:'Ask Claude what changed'});
+    sockets[0].h.message({data:JSON.stringify(['EVENT','messages',e])});
+    for(let i=0;i<100&&posts.length<3;i++)await new Promise(r=>setTimeout(r,10));
+    assert.deepEqual(posts,['What changed?','Buzz changed.','Claude changed Buzz.']);
+    assert.equal(prompts.length,3);assert.ok(prompts[1].includes(claude));assert.ok(prompts[1].includes(owner));
+    assert.ok(registered.some(t=>t.name==='mcp__buzz__buzz_ask'));
+    const who=registered.find(t=>t.name==='mcp__buzz__buzz_whoami');
+    assert.throws(()=>who.execute({}, {agent:{session:{id:'unbound-bridge'}}}),/not bound/);
+  }finally{dispose?.();await new Promise(r=>setTimeout(r,20));globalThis.WebSocket=original;rmSync(dir,{recursive:true,force:true});}
+});

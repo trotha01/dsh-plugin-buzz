@@ -58,7 +58,7 @@ export function route(e, { me, allowFrom, allowAgents = new Set(), dmChannels, t
  * One identity's live connection. `answer(text, ctx)` returns the reply text; `send(reply)` posts it.
  * Reconnects with backoff and resubscribes from the last event seen, so a dropped socket loses nothing.
  */
-export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [], maxAgentReplies = 10, ownerPubkey, beforeAnswer = async () => {}, answer, send, log, store, WebSocketImpl = globalThis.WebSocket, now = () => Date.now(), statusIntervalMs = 60_000 }) {
+export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [], maxAgentReplies = 10, ownerPubkey, beforeAnswer = async () => {}, explicitRequests = false, answer, send, log, store, WebSocketImpl = globalThis.WebSocket, now = () => Date.now(), statusIntervalMs = 60_000 }) {
   const me = bytesToHex(schnorr.getPublicKey(hexToBytes(secretHex)));
   const url = wsUrl(relayUrl);
   const allow = new Set(allowFrom);
@@ -98,7 +98,7 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
     seen.add(e.id); if (seen.size > 5000) seen.delete(seen.values().next().value);
     if (e.created_at > since) since = e.created_at;
     const r = route(e, { me, allowFrom: allow, allowAgents: agentsAllowed, dmChannels, threads });
-    if (!r) return;
+    if (!r || (explicitRequests && r.fromAgent)) return;
     if (r.fromAgent) {
       const n = agentReplies.get(r.threadKey) ?? 0;
       if (n >= limit) return void log({ event: "buzz_agent_cap", agent: name, thread: r.threadKey.slice(0, 12), replies: n });
@@ -156,7 +156,7 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
       finished = true;
       clearInterval(timer);
       if (closed) return;
-      await post(text || "(no answer)", true);
+      if (text) await post(text, true);
       log({ event: "buzz_turn", agent: name, thread: r.threadKey.slice(0, 12), ms: now() - t0, chars: (text || "").length });
     }).catch((err) => log({ event: "buzz_turn_error", agent: name, error: String(err?.message || err).slice(0, 200) }))
       .finally(() => { finished = true; clearInterval(timer); statusTimers.delete(timer); });

@@ -120,7 +120,9 @@ let runCli = (args, stdin) => new Promise((resolve, reject) => {
   child.stdin.end(stdin ?? "");
 });
 export function setRunner(fn) { runCli = fn; }                           // tests
-const json = async (args, stdin) => { const out = (await runCli(args, stdin)).trim(); return out ? JSON.parse(out) : null; };
+export const buzzJson = async (args, stdin) => { const out = (await runCli(args, stdin)).trim(); return out ? JSON.parse(out) : null; };
+
+const json = buzzJson;
 
 /** Confirm the owner can read the original conversation before delivering any agent text.
  * Never cache membership: removal must take effect on the very next send. */
@@ -199,8 +201,19 @@ const cursorFile = () => {
 const readCursor = () => { try { return Number(readFileSync(cursorFile(), "utf8").trim()) || 0; } catch { return 0; } };
 const writeCursor = (t) => { const f = cursorFile(); writeFileSync(f + ".tmp", String(t) + "\n", { mode: 0o600 }); renameSync(f + ".tmp", f); };
 
-async function sendMessage({ channel, content, reply_to, mentions, direct = false }) {
+async function sendMessage({ channel, content, reply_to, mentions, direct = false, intent = "info", request_id }) {
   const identity = identityContext.getStore();
+  if (!['info', 'request', 'answer', 'blocked'].includes(intent)) throw new Error('Unknown message intent');
+  if (intent !== 'info') {
+    const controller = identity?.requestController, ctx = identity?.requestContext;
+    if (!controller || !ctx) throw new Error('Explicit requests require a bound DSH Buzz conversation');
+    if (intent === 'request') {
+      if (!Array.isArray(mentions) || mentions.length !== 1) throw new Error('A request requires exactly one recipient');
+      return JSON.stringify(await controller.ask(ctx, mentions[0], content));
+    }
+    return JSON.stringify(await controller.respond(ctx, request_id || ctx.requestId, intent, content));
+  }
+  if (identity?.requestController && identity.requestContext) identity.requestController.assertActive(identity.requestContext);
   if (identity?.replyOnly) throw new Error("Return your reply as assistant text; Buzz delivers it in the current thread and enforces the conversation limit.");
   if (typeof content !== "string" || !content.trim()) throw new Error("content is empty");
   const mentionFlags = await mentionArgs(mentions);
@@ -275,9 +288,10 @@ export const TOOLS = [
       return render(await json(["messages", "thread", "--channel", await channelId(channel), "--event", message_id, "--limit", "100"]));
     } },
   { name: "buzz_dm", description: "Open a group DM with another agent and your human owner, and send as your own identity. Use this when asked to message another agent; never use a public channel for that conversation.",
-    inputSchema: { type: "object", properties: { recipients: { type: "array", minItems: 1, maxItems: 7, items: { type: "string" } }, content: str("Message text") }, required: ["recipients", "content"] },
-    run: async ({ recipients, content }) => {
+    inputSchema: { type: "object", properties: { recipients: { type: "array", minItems: 1, maxItems: 7, items: { type: "string" } }, content: str("Message text"), intent: { enum: ["info", "request", "answer", "blocked"], description: "Default info never runs another agent. Use request for work or clarification." }, request_id: str("Request being answered") }, required: ["recipients", "content"] },
+    run: async ({ recipients, content, intent, request_id }) => {
       if (!Array.isArray(recipients) || !recipients.length) throw new Error("recipients are required");
+      if (intent && intent !== 'info') return sendMessage({content, mentions: recipients, intent, request_id});
       const mentions = await mentionArgs(recipients);
       return sendMessage({ content, mentions: mentions.filter((_, i) => i % 2), direct: true });
     } },
@@ -285,6 +299,8 @@ export const TOOLS = [
     inputSchema: { type: "object", properties: {
       channel: str("Channel name (e.g. general) or UUID"),
       content: str("Message text"),
+      intent: { enum: ["info", "request", "answer", "blocked"], description: "Default info does not schedule agents. request requires one configured agent in mentions; it opens an owner-visible DM." },
+      request_id: str("Request being answered"),
       reply_to: str("Optional: id of the message you are replying to"),
       mentions: { type: "array", items: { type: "string" }, description: "Optional: display names or public keys of the people or agents to notify" } }, required: ["channel", "content"] },
     run: sendMessage },

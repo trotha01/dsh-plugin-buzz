@@ -12,6 +12,8 @@ import { readKey, pubkeyOf, cliPath, cliEnv, validateRelay, ensureOwner, TOOLS, 
 import { listen } from './listen.mjs'
 import { makeAnswerer } from './agent-turn.mjs'
 import { eventImages } from './media.mjs'
+import { RequestController, requestPrompt } from './requests.mjs'
+import { requestTransport, requestTools } from './request-transport.mjs'
 
 export const name = 'buzz'
 export const inject = ['tools']
@@ -25,8 +27,10 @@ export const Config = Schema.object({
   serverName: Schema.string().default('buzz').description('Tool namespace: tools appear as mcp__<serverName>__buzz_send'),
   ownerPubkey: Schema.string().default('').description('Human owner public key. Added to every conversation before agent messages are sent; sends fail closed if membership cannot be confirmed. Default: $BUZZ_OWNER_PUBKEY'),
   allowFrom: Schema.array(Schema.string()).default([]).description('Buzz public keys (64-character hex) whose messages the agents below answer. Empty: they answer nobody'),
-  allowAgents: Schema.array(Schema.string()).default([]).description('Public keys of other agents (e.g. a colleague\'s models) the agents below answer, but when that agent @mentions them or sends a DM. The agents below always accept each other this way'),
-  maxAgentReplies: Schema.natural().default(10).description('Loop guard: replies to agents per Buzz thread, per identity (maximum 10; persists across restarts)'),
+  allowAgents: Schema.array(Schema.string()).default([]).description('Other agent public keys recognized for owner-visible DMs. Automatic mention replies apply only in legacy mode'),
+  explicitRequests: Schema.boolean().default(true).description('Use explicit, durable agent requests instead of automatic agent replies'),
+  requestStore: Schema.string().default('').description('SQLite request ledger path; defaults beside the first agent key'),
+  maxAgentReplies: Schema.natural().default(10).description('Shared request budget per originating human event (maximum 10); legacy mode uses per-thread reply caps'),
   cwd: Schema.string().default('').description('Working directory of the dsh conversations started from Buzz. Default: where dsh runs'),
   agents: Schema.array(Schema.object({
     name: Schema.string().required().description('Label for logs and Session ids, e.g. Claude'),
@@ -118,9 +122,9 @@ export function registerIdentityTools(ctx, row, identities, agentPubkeys) {
     output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
     execute: (args, exec) => {
       const identity = identities.get(exec.agent)
-      if (!identity && String(exec.agent?.session?.id || '').startsWith('session-buzz-'))
+      if (!identity)
         throw new Error('Buzz identity is not bound to this conversation; send a new message in Buzz before using its tools')
-      return withIdentity(identity || { ...row.env, agentPubkeys }, () => tool.run(args))
+      return withIdentity(identity, () => tool.run(args))
     },
   })
 }
@@ -169,17 +173,60 @@ export async function apply(ctx, config = {}) {
   const identities = new WeakMap()
   if (typeof row !== 'string') registerIdentityTools(ctx, row, identities, allowAgents)
   const maxAgentReplies = Number.isInteger(config.maxAgentReplies) ? config.maxAgentReplies : 10
+  const explicitRequests = config.explicitRequests !== false
+  const configured = new Map([...keys].map(([a, key]) => [pubkeyOf(key), {
+    ...(typeof row === 'string' ? {} : row.env), name: a.name, BUZZ_KEY_FILE: a.keyFile,
+    BUZZ_RELAY_URL: relayUrl, BUZZ_CLI: cli, BUZZ_OWNER_PUBKEY: ownerPubkey, agentPubkeys: allowAgents,
+  }]))
+  const answerers = new Map()
+  let controller
+  for (const [a, key] of keys) {
+    const actor = pubkeyOf(key)
+    answerers.set(actor, makeAnswerer(ctx, { ...a, cwd: a.cwd || cwd }, { ...deps,
+      bindIdentity: (agent, event, requestContext) => identities.set(agent, {
+        ...configured.get(actor), requestContext, requestController: controller, replyOnly: !explicitRequests && allowAgents.includes(event?.pubkey),
+      }), images: event => eventImages(event, { secretHex: key, relayUrl }),
+    }))
+  }
+  if (explicitRequests && ownerPubkey && keys.size) {
+    controller = new RequestController({
+      file: config.requestStore || `${[...keys.keys()][0].keyFile}.requests.sqlite`,
+      transport: requestTransport(configured), limit: maxAgentReplies, log: warn,
+      run: (binding, { kind, snapshot }) => answerers.get(binding.actor)('', {
+        threadKey: binding.threadKey || `request:${binding.exchange}:${binding.requestId || 'caller'}`,
+        requestContext: binding, runtimePrompt: requestPrompt(kind, snapshot),
+        beforeTurn: async () => { controller.assertActive(binding); await controller.inspect(binding, snapshot.request?.id); },
+      }),
+    })
+    for (const tool of requestTools(controller)) ctx.tools.register({
+      name: `mcp__${config.serverName || 'buzz'}__${tool.name}`, description: tool.description,
+      parameters: tool.inputSchema,
+      output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+      execute: async (args, exec) => {
+        const binding = identities.get(exec.agent)?.requestContext
+        if (!binding) throw new Error('No bound Buzz request context; start from your owner DM')
+        return JSON.stringify(await tool.run(args, binding))
+      },
+    })
+    controller.kick()
+  } else if (explicitRequests) warn('Agent requests require a configured human owner; automatic agent replies are disabled')
   for (const a of agents) {
     const secretHex = keys.get(a)
     if (!secretHex) continue
+    const actor = pubkeyOf(secretHex)
     const conn = listen({
-      name: a.name, relayUrl, secretHex, allowFrom, allowAgents, maxAgentReplies, ownerPubkey,
+      name: a.name, relayUrl, secretHex, allowFrom, allowAgents, maxAgentReplies, ownerPubkey, explicitRequests,
       beforeAnswer: makeVisibilityGuard({ relayUrl, keyFile: a.keyFile, cli, ownerPubkey }),
-      // Images attached in Buzz are fetched with this identity's key (it is a member of the channel).
-      answer: makeAnswerer(ctx, { ...a, cwd: a.cwd || cwd }, { ...deps, bindIdentity: (agent, event) => identities.set(agent, {
-        ...row.env, BUZZ_KEY_FILE: a.keyFile, agentPubkeys: allowAgents,
-        replyOnly: allowAgents.includes(event?.pubkey),
-      }), images: (event) => eventImages(event, { secretHex, relayUrl }) }),
+      answer: async (text, options) => {
+        if (!controller) return answerers.get(actor)(text, options)
+        const binding = controller.start({ actor, owner: ownerPubkey, origin: options.event.id, threadKey: options.threadKey,
+          channel: options.event.tags.find(t => t[0] === 'h')[1], replyTo: options.event.id, human: options.event.pubkey === ownerPubkey })
+        const snapshot = await controller.inspect(binding)
+        const result = await answerers.get(actor)(text, { ...options, onProgress: undefined,
+          requestContext: binding, runtimePrompt: requestPrompt('human', snapshot) + '\n\nHuman message:\n' })
+        const output = await controller.finish(binding, result)
+        return output?.text || ''
+      },
       send: makeSender({ relayUrl, keyFile: a.keyFile, cli, ownerPubkey }),
       store: threadStore(a.keyFile),
       log: (o) => say(JSON.stringify(o)),
@@ -191,5 +238,5 @@ export async function apply(ctx, config = {}) {
     say(`Buzz agent ${a.name} (${a.provider}/${a.model}) listening as ${conn.me}`)
     live.push(conn)
   }
-  ctx.on?.('dispose', () => { for (const c of live) { c.close(); if (LISTENERS.get(c.me) === c) LISTENERS.delete(c.me) } })
+  ctx.on?.('dispose', () => { void controller?.close(); for (const c of live) { c.close(); if (LISTENERS.get(c.me) === c) LISTENERS.delete(c.me) } })
 }
