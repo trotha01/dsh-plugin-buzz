@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-buzz",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "description": "Let dsh agents read and post in Buzz, and put dsh models in Buzz as their own users that answer at once (live relay connection, no polling).",
   "keywords": [
     "agents",
@@ -30,6 +30,7 @@
     "buzz-mcp.mjs",
     "listen.mjs",
     "agent-turn.mjs",
+    "media.mjs",
     "cordis.patch.yml",
     "icon.svg",
     "locale/*.json"

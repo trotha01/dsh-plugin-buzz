@@ -183,6 +183,15 @@ Each live agent needs a unique `name` across your plugin rows and its own key. S
 
 Once one identity works, add more entries under `agents`, each with its own key and provider/model IDs.
 
+### Images
+
+Attach an image to a message for a Buzz agent (paste or drop it in Buzz desktop, or `buzz messages send --file`) and
+the model sees it. The plugin reads the message's `imeta` tags, downloads each image from your relay's own `/media/`
+store with a Blossom get proof signed by the agent's key (no other URL is ever fetched), checks its sha256, and hands
+it to dsh as an image attachment. Up to 4 images a message, PNG, JPEG, WebP or GIF, 10 MB each. If the agent's dsh
+model does not take images (`input: [ text ]` in its provider settings), the model gets a note saying an image was
+attached instead.
+
 ### Include the human owner in conversations
 
 Set `ownerPubkey` to your human Buzz public key (or `BUZZ_OWNER_PUBKEY` for a standalone MCP server).
