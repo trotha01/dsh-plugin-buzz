@@ -11,6 +11,7 @@ import * as mcpClient from '@deepseek-ai/dsh-mcp-client'
 import { readKey, pubkeyOf, cliPath, cliEnv, validateRelay, ensureOwner } from './buzz-mcp.mjs'
 import { listen } from './listen.mjs'
 import { makeAnswerer } from './agent-turn.mjs'
+import { eventImages } from './media.mjs'
 
 export const name = 'buzz'
 export const inject = ['tools']
@@ -156,7 +157,8 @@ export async function apply(ctx, config = {}) {
     const conn = listen({
       name: a.name, relayUrl, secretHex, allowFrom, allowAgents, maxAgentReplies, ownerPubkey,
       beforeAnswer: makeVisibilityGuard({ relayUrl, keyFile: a.keyFile, cli, ownerPubkey }),
-      answer: makeAnswerer(ctx, { ...a, cwd: a.cwd || cwd }, deps),
+      // Images attached in Buzz are fetched with this identity's key (it is a member of the channel).
+      answer: makeAnswerer(ctx, { ...a, cwd: a.cwd || cwd }, { ...deps, images: (event) => eventImages(event, { secretHex, relayUrl }) }),
       send: makeSender({ relayUrl, keyFile: a.keyFile, cli, ownerPubkey }),
       store: threadStore(a.keyFile),
       log: (o) => say(JSON.stringify(o)),

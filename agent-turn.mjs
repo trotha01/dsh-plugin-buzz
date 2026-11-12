@@ -28,9 +28,43 @@ export function finalText(session, firstSeq) {
   return text;
 }
 
+/** Does provider/model take image input? true/false from dsh's model list; undefined when dsh does not say. */
+export async function acceptsImages(ctx, provider, model) {
+  try {
+    const info = (await ctx.get("llm")?.listModels?.(provider))?.find((m) => m.id === model);
+    return Array.isArray(info?.inputModalities) ? info.inputModalities.includes("image") : undefined;
+  } catch { return undefined; }
+}
+
+/**
+ * The user message content for one Buzz message: the text, then each attached image saved in dsh's attachment store
+ * as an image block when the model takes images; otherwise (or when saving fails) a note says what was not shown.
+ */
+export async function userContent(ctx, { provider, model }, body, images = [], failed = 0) {
+  const content = [{ type: "text", text: body }];
+  const notes = [];
+  if (failed) notes.push(`${failed} attached image(s) could not be downloaded from Buzz`);
+  if (images.length) {
+    const store = ctx.get("attachments");
+    if ((await acceptsImages(ctx, provider, model)) === false) notes.push(`${images.length} image(s) attached in Buzz; this model (${model}) cannot see images`);
+    else if (!store?.saveImage) notes.push(`${images.length} image(s) attached in Buzz; dsh has no attachment store to pass them on`);
+    else {
+      let lost = 0;
+      for (const img of images) {
+        try { content.push({ type: "image", attachment: await store.saveImage({ data: img.data, mediaType: img.mediaType, name: img.name }) }); }
+        catch { lost++; }
+      }
+      if (lost) notes.push(`${lost} attached image(s) were refused by dsh (type, size or dimensions)`);
+    }
+  }
+  if (notes.length) content[0] = { type: "text", text: `${body}\n\n[${notes.join("; ")}]` };
+  return content;
+}
+
 /**
  * Returns answer(text, { threadKey }) for one identity. `deps` carries dsh's helpers (createUserMessage,
- * installModelSelection, brandString, SessionSeq), injected so tests run without dsh.
+ * installModelSelection, brandString, SessionSeq, and optionally images(event) -> { images, failed } for Buzz
+ * attachments), injected so tests run without dsh.
  */
 export function makeAnswerer(ctx, { name, provider, model, instructions = "", cwd }, deps) {
   const selection = { provider, model };
@@ -38,7 +72,7 @@ export function makeAnswerer(ctx, { name, provider, model, instructions = "", cw
     if (agent.model.current()?.model !== model || agent.model.current()?.provider !== provider) agent.model.select({ ...selection });
     deps.installModelSelection(agentCtx);
   };
-  return async (text, { threadKey, onProgress }) => {
+  return async (text, { threadKey, onProgress, event }) => {
     const agents = ctx.get("agents");
     if (!agents) throw new Error("dsh agents service is not available");
     const sessionId = deps.brandString(sessionIdFor(name, threadKey));
@@ -50,6 +84,8 @@ export function makeAnswerer(ctx, { name, provider, model, instructions = "", cw
     await agent.whenIdle();
     const firstSeq = agent.session.seq;
     const body = instructions ? `${instructions}\n\n---\n${text}` : text;
+    const { images = [], failed = 0 } = event && deps.images ? await deps.images(event) : {};
+    const content = await userContent(ctx, { provider, model }, body, images, failed);
     // Some runtime failures emit agent/error without a durable turn/end event.
     // Track only this conversation and release both listeners after every request.
     let failure;
@@ -68,7 +104,7 @@ export function makeAnswerer(ctx, { name, provider, model, instructions = "", cw
       }
     });
     try {
-      agent.followup(deps.createUserMessage({ content: [{ type: "text", text: body }], source: { kind: "user" } }));
+      agent.followup(deps.createUserMessage({ content, source: { kind: "user" } }));
       const subagents = ctx.get("subagents");
       for (;;) {
         await agent.whenIdle();
