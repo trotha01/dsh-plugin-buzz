@@ -490,3 +490,31 @@ test('agent requests receive no automatic status', async t => {
     finish();await flush();assert.equal(f.posts.length,1);assert.equal(f.posts[0].mention,OTHER_PK);
   } finally {finish();f.connection.close();}
 });
+
+test('owner-inclusive agent DMs retain routing and block model work when owner access fails', async () => {
+  const sockets = [], answers = [], logs = [];
+  let permitted = false, checks = 0;
+  class FakeWS {
+    constructor() { this.h = {}; sockets.push(this); }
+    addEventListener(k, f) { this.h[k] = f; }
+    send() {}
+    message(frame) { this.h.message({data: JSON.stringify(frame)}); }
+    close() {}
+  }
+  const c = listen({name: 'test', relayUrl: 'https://relay.example', secretHex: AGENT,
+    allowFrom: [OWNER_PK], allowAgents: [OTHER_PK], ownerPubkey: OWNER_PK, WebSocketImpl: FakeWS,
+    beforeAnswer: async () => { checks++; if (!permitted) throw new Error('owner missing'); },
+    answer: async text => { answers.push(text); return 'ok'; }, send: async () => undefined, log: e => logs.push(e)});
+  try {
+    const ws = sockets[0];
+    ws.message(['EVENT', 'groups', signEvent(OWNER, {kind: 39002, tags: [['d', CH], ['p', ME], ['p', OTHER_PK], ['p', OWNER_PK]]})]);
+    ws.message(['EVENT', 'messages', msg(OTHER, [], 'blocked')]);
+    await new Promise(r => setImmediate(r));
+    assert.equal(checks, 1); assert.deepEqual(answers, []);
+    assert.ok(logs.some(e => e.event === 'buzz_turn_error'));
+    permitted = true;
+    ws.message(['EVENT', 'messages', msg(OTHER, [], 'visible')]);
+    await new Promise(r => setImmediate(r));
+    assert.deepEqual(answers, ['visible']);
+  } finally { c.close(); }
+});

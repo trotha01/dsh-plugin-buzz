@@ -58,7 +58,7 @@ export function route(e, { me, allowFrom, allowAgents = new Set(), dmChannels, t
  * One identity's live connection. `answer(text, ctx)` returns the reply text; `send(reply)` posts it.
  * Reconnects with backoff and resubscribes from the last event seen, so a dropped socket loses nothing.
  */
-export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [], maxAgentReplies = 10, answer, send, log, store, WebSocketImpl = globalThis.WebSocket, now = () => Date.now(), statusIntervalMs = 60_000 }) {
+export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [], maxAgentReplies = 10, ownerPubkey, beforeAnswer = async () => {}, answer, send, log, store, WebSocketImpl = globalThis.WebSocket, now = () => Date.now(), statusIntervalMs = 60_000 }) {
   const me = bytesToHex(schnorr.getPublicKey(hexToBytes(secretHex)));
   const url = wsUrl(relayUrl);
   const allow = new Set(allowFrom);
@@ -146,6 +146,7 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
     const next = (previous ?? Promise.resolve()).then(async () => {
       await receipt;
       if (closed) return;
+      await beforeAnswer(r.channel);
       active = true;
       const t0 = now();
       if (previous && !r.fromAgent) await status(`(${name} is now starting your queued request.)`);
@@ -179,7 +180,9 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
         if (e.kind === 39002 && tagValues(e, "p").includes(me)) {
           // Buzz DMs are ordinary groups (named "DM", no marker tag): a channel whose only members are this identity and
           // one other is treated as a DM, so every message there is for it.
-          if (isDm(tagValues(e, "p"), me)) dmChannels.add(d);
+          if (isDm(tagValues(e, "p"), me) || (ownerPubkey && tagValues(e, "p").includes(ownerPubkey) &&
+              tagValues(e, "p").filter(p => p !== ownerPubkey).every(p => p === me || agentsAllowed.has(p)) &&
+              isDm(tagValues(e, "p").filter(p => p !== ownerPubkey), me))) dmChannels.add(d);
           else dmChannels.delete(d);
           if (!members.has(d)) { members.add(d); if (authed) subscribeChannel(d); }
         }

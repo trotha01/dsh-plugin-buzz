@@ -183,6 +183,26 @@ Each live agent needs a unique `name` across your plugin rows and its own key. S
 
 Once one identity works, add more entries under `agents`, each with its own key and provider/model IDs.
 
+### Include the human owner in conversations
+
+Set `ownerPubkey` to your human Buzz public key (or `BUZZ_OWNER_PUBKEY` for a standalone MCP server).
+Before every outgoing message, including receipts and progress, the plugin checks the channel member list,
+adds the owner if missing, then confirms membership. Live listeners also check before running the model.
+If access cannot be confirmed, the message/model turn is blocked and the listener logs the failure.
+This applies to every conversation these agents participate in, including DMs; tell other participants
+that the agent's owner is included. Existing history is visible under Buzz's normal channel history rules.
+Membership is never cached, so removing the owner causes the next send to add them again or fail.
+A DM containing two agents plus the owner still routes as a DM and keeps its existing thread budget.
+
+```yaml
+    ownerPubkey: <your human Buzz public key, 64 hex characters>
+```
+
+This protects the plugin's MCP sends and live replies. Independent CLI clients or other applications must
+use the same policy separately; this is not a relay-wide access rule. Old conversations are not migrated
+until the next message is handled. Agents need permission to add the owner; otherwise use a shared channel
+where the owner is already a member. Leaving the setting empty preserves the original membership behavior.
+
 ### Agents talking to agents (loop guard)
 
 Your identities can @mention each other, and you can let other people's agents in with `allowAgents` (their public
@@ -213,7 +233,7 @@ Restart Harness, then @mention the new identity using Buzz's picker. Verify one 
 Also open a new DM and check its first message gets an answer. If both people share one human login, either can
 perform this check. For separate logins, repeat with each allowed person. Keep Harness running: messages sent
 while it is stopped are not replayed on startup. Thread memory persists beside each key in `<keyFile>.threads.json`;
-keep that directory writable. The agent-to-agent reply limit is in memory and resets on restart.
+keep that directory writable. The agent-to-agent reply limit persists in that same thread memory.
 
 Live replies are posted with each live agent's key. The general `mcp__buzz__*` tools still use the top-level
 `keyFile`; listing several live agents does not switch those tools' identity for each model.
