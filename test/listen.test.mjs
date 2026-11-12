@@ -61,7 +61,7 @@ test("route: answers the owner's mention, DM and thread reply; ignores others, i
   const inThread = msg(OWNER, [["e", "ab".repeat(32), "", "reply"]]);
   assert.equal(route(inThread, { ...base, threads }).threadKey, "root-1");  // follow-up without @mention
   const dm = route(msg(OWNER, []), { ...base, dmChannels: new Set([CH]) });
-  assert.equal(dm.threadKey, `dm:${CH}`);
+  assert.equal(dm.threadKey, msg(OWNER, []).id);
 });
 
 test("route: allowed agents can mention or DM; bare group replies are ignored", () => {
@@ -539,3 +539,16 @@ test('explicit mode ignores agent mentions and close-outs while still answering 
     assert.ok(!sent.some(s=>s.text.includes('no answer')));
   } finally {c.close();}
 });
+
+ test('DM roots separate sessions while replies preserve restored mappings', () => {
+  const first = msg(OWNER, [], 'first task'), second = msg(OWNER, [], 'second task');
+  const base = {me:ME, allowFrom:new Set([OWNER_PK]), dmChannels:new Set([CH]), threads:new Map()};
+  const a = route(first, base), b = route(second, base);
+  assert.notEqual(sessionIdFor('Codex', a.threadKey), sessionIdFor('Codex', b.threadKey));
+  assert.notEqual(sessionIdFor('Claude', a.threadKey), sessionIdFor('Codex', a.threadKey));
+  const reply = msg(OWNER, [['e', first.id, '', 'root']], 'continue');
+  assert.equal(route(reply, base).threadKey, first.id);
+  const restored = {...base, threads:new Map([[first.id, `dm:${CH}`]])};
+  assert.equal(route(reply, restored).threadKey, `dm:${CH}`);
+  assert.equal(route(second, restored).threadKey, second.id);
+ });

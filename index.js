@@ -195,6 +195,7 @@ export async function apply(ctx, config = {}) {
       run: (binding, { kind, snapshot }) => answerers.get(binding.actor)('', {
         threadKey: binding.threadKey || `request:${binding.exchange}:${binding.requestId || 'caller'}`,
         requestContext: binding, runtimePrompt: requestPrompt(kind, snapshot),
+        sessionTopic: snapshot.request?.message,
         beforeTurn: async () => { controller.assertActive(binding); await controller.inspect(binding, snapshot.request?.id); },
       }),
     })

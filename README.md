@@ -464,3 +464,19 @@ with elapsed time. This confirms the request is pending; it does not claim the
 model has made progress. Status updates stop on completion, failure, or listener
 shutdown. Automatic status messages and model progress are not sent for agent requests;
 the explicit request ledger bounds agent conversations. Human turns in explicit mode publish final text only, so bridge JSON is never streamed into chat.
+
+### Buzz sessions in Harness
+
+Each new top-level Buzz message starts a separate session for the receiving model,
+including in DMs. Reply in its Buzz thread to continue that session. Replies keep
+existing saved mappings across restarts, including older channel-wide DM sessions;
+existing history is not split or rewritten.
+
+Sessions are titled `Buzz · <agent> · <initial message>` using a short excerpt of
+actual message content, not the runtime envelope. Existing automatic titles are
+corrected when their session next runs; manual titles are preserved. Agent requests
+use their request text as the topic. This requires Harness's `sessionTitle` service;
+without it, routing still works and Harness supplies its usual titles.
+
+This changes human-message session routing only. Agent requests, results and
+clarifications retain their existing request bindings and shared exchange budget.

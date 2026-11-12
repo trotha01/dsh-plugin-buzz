@@ -50,7 +50,9 @@ export function route(e, { me, allowFrom, allowAgents = new Set(), dmChannels, t
   const mentioned = tagValues(e, "p").includes(me);
   if (!mentioned && !known && !dmChannels.has(channel)) return null;
   const root = refs.find((t) => t[3] === "root")?.[1] ?? refs.find((t) => t[3] === "reply")?.[1] ?? refs[0]?.[1];
-  const threadKey = known ? threads.get(known) : dmChannels.has(channel) && !root ? `dm:${channel}` : root ?? e.id;
+  // A DM contains independent threads. Preserve recorded mappings (including legacy
+  // channel-wide sessions) only for replies; a new top-level message starts fresh.
+  const threadKey = known ? threads.get(known) : root ?? e.id;
   return { threadKey, replyTo: root ?? e.id, channel, fromAgent };
 }
 

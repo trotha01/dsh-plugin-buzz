@@ -121,3 +121,29 @@ test('Buzz identity and verified delivery metadata are set before the model star
   assert.match(body,/channel=group-dm/);
   assert.match(body,/not an AI Bridge inbox/);
 });
+
+test('Buzz titles are set before input, persist on replies, and respect manual renames', async () => {
+  let current, receivedTitle;
+  const renamed = [];
+  const session = {seq:0,eventAt:()=>undefined};
+  const agent = {status:'idle',session,whenIdle:async()=>{},followup:()=>{receivedTitle=current.title;}};
+  const titles = {get:()=>current,rename:(actual,title)=>{
+    assert.equal(actual,session);
+    current={title,source:{kind:'user'}}; renamed.push(title);
+  }};
+  const answer=makeAnswerer({get:n=>({agents:{get:()=>agent},sessionTitle:titles}[n])},
+    {name:'Codex',provider:'p',model:'m'}, {brandString:s=>s,createUserMessage:s=>s,SessionSeq:s=>s});
+  await answer('Fix\nTagalog channel',{threadKey:'first'});
+  assert.equal(receivedTitle,'Buzz · Codex · Fix Tagalog channel');
+  await answer('Continue',{threadKey:'first'});
+  assert.equal(renamed.length,1);
+  current={title:'My custom title',source:{kind:'user'}};
+  await answer('Continue',{threadKey:'first'});
+  assert.equal(receivedTitle,'My custom title');
+  current={title:'Review and Simplify AI-247',source:{kind:'llm'}};
+  await answer('Fix Tagalog channel',{threadKey:'legacy'});
+  assert.equal(receivedTitle,'Buzz · Codex · Fix Tagalog channel');
+  current=undefined;
+  await answer('',{threadKey:'request',sessionTopic:'Review the channel fix'});
+  assert.equal(receivedTitle,'Buzz · Codex · Review the channel fix');
+});
