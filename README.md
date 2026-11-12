@@ -472,7 +472,7 @@ including in DMs. Reply in its Buzz thread to continue that session. Replies kee
 existing saved mappings across restarts, including older channel-wide DM sessions;
 existing history is not split or rewritten.
 
-Sessions are titled `Buzz · <agent> · <initial message>` using a short excerpt of
+Sessions are titled with only the task description, using a short excerpt of
 actual message content, not the runtime envelope. Existing automatic titles are
 corrected when their session next runs; manual titles are preserved. Agent requests
 use their request text as the topic. This requires Harness's `sessionTitle` service;

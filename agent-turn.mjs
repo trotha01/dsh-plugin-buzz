@@ -84,15 +84,15 @@ export function makeAnswerer(ctx, { name, provider, model, instructions = "", cw
     }
     await agent.whenIdle();
     await beforeTurn?.();
-    // Use the title service so automatic title generation cannot replace the Buzz label.
-    // Preserve deliberate user renames and existing Buzz titles. Old automatic titles
+    // Use the title service so automatic title generation cannot replace the task title.
+    // Preserve deliberate user renames and existing task titles. Old automatic titles
     // are repaired on the next turn, without rewriting history or splitting the session.
     const titles = ctx.get("sessionTitle");
     if (titles) {
       const current = titles.get(agent.session);
-      if (!current || (current.source?.kind !== "user" && !current.title?.startsWith("Buzz · "))) {
+      if (!current || current.source?.kind !== "user") {
         const topic = String(sessionTopic || text || "Agent request").replace(/[\s\p{Cc}\p{Cf}]+/gu, " ").trim();
-        titles.rename(agent.session, `Buzz · ${name} · ${Array.from(topic).slice(0, 80).join("") || "Conversation"}`);
+        titles.rename(agent.session, Array.from(topic).slice(0, 80).join("") || "Task");
       }
     }
     deps.bindIdentity?.(agent, event, requestContext);

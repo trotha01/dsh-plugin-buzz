@@ -134,7 +134,7 @@ test('Buzz titles are set before input, persist on replies, and respect manual r
   const answer=makeAnswerer({get:n=>({agents:{get:()=>agent},sessionTitle:titles}[n])},
     {name:'Codex',provider:'p',model:'m'}, {brandString:s=>s,createUserMessage:s=>s,SessionSeq:s=>s});
   await answer('Fix\nTagalog channel',{threadKey:'first'});
-  assert.equal(receivedTitle,'Buzz · Codex · Fix Tagalog channel');
+  assert.equal(receivedTitle,'Fix Tagalog channel');
   await answer('Continue',{threadKey:'first'});
   assert.equal(renamed.length,1);
   current={title:'My custom title',source:{kind:'user'}};
@@ -142,8 +142,8 @@ test('Buzz titles are set before input, persist on replies, and respect manual r
   assert.equal(receivedTitle,'My custom title');
   current={title:'Review and Simplify AI-247',source:{kind:'llm'}};
   await answer('Fix Tagalog channel',{threadKey:'legacy'});
-  assert.equal(receivedTitle,'Buzz · Codex · Fix Tagalog channel');
+  assert.equal(receivedTitle,'Fix Tagalog channel');
   current=undefined;
   await answer('',{threadKey:'request',sessionTopic:'Review the channel fix'});
-  assert.equal(receivedTitle,'Buzz · Codex · Review the channel fix');
+  assert.equal(receivedTitle,'Review the channel fix');
 });
