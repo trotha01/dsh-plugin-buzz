@@ -223,10 +223,22 @@ export async function apply(ctx, config = {}) {
         const binding = controller.start({ actor, owner: ownerPubkey, origin: options.event.id, threadKey: options.threadKey,
           channel: options.event.tags.find(t => t[0] === 'h')[1], replyTo: options.event.id, human: options.event.pubkey === ownerPubkey })
         const snapshot = await controller.inspect(binding)
-        const result = await answerers.get(actor)(text, { ...options, onProgress: undefined,
-          requestContext: binding, runtimePrompt: requestPrompt('human', snapshot) + '\n\nHuman message:\n' })
+        let result, failure
+        try {
+          result = await answerers.get(actor)(text, { ...options, onProgress: undefined,
+            requestContext: binding, runtimePrompt: requestPrompt('human', snapshot) + '\n\nHuman message:\n' })
+        } catch (err) {
+          // A turn can fail after the model has already finished its message (a provider reporting
+          // context overflow on a completed answer, for one). Throwing here would also throw away the
+          // agent requests in that message, so the finished text is still carried out and delivered
+          // with the failure named, instead of only "(could not answer)".
+          if (typeof err?.finalText !== 'string' || !err.finalText.trim()) throw err
+          result = err.finalText
+          failure = String(err?.message || err)
+        }
         const output = await controller.finish(binding, result)
-        return output?.text || ''
+        return [output?.text, failure && `(${a.name}: the model turn reported a failure after this message: ${failure})`]
+          .filter(t => t && t.trim()).join('\n\n')
       },
       send: makeSender({ relayUrl, keyFile: a.keyFile, cli, ownerPubkey }),
       store: threadStore(a.keyFile),
