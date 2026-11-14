@@ -128,7 +128,17 @@ export class RequestController {
     if (action?.buzz) {
       const a = action.buzz;
       if (a.type === 'request') return this.ask(ctx, a.to, a.message);
-      if (a.type === 'answer' || a.type === 'blocked') return this.respond(ctx, ctx.requestId, a.type, a.message);
+      if (a.type === 'answer' || a.type === 'blocked') {
+        // Root human turns and their resumed results have no agent request ID.
+        // Return their text to the caller's DM delivery path instead of respond().
+        if (!ctx.requestId) {
+          this.assertActive(ctx);
+          if (typeof a.message !== 'string' || !a.message.trim() || a.message.length > 32_000)
+            throw new Error('A nonempty answer of at most 32000 characters is required');
+          return { text: a.message };
+        }
+        return this.respond(ctx, ctx.requestId, a.type, a.message);
+      }
       if (a.type === 'cancel') return this.cancel(ctx);
       if (a.type !== 'done') throw new Error('Unknown Buzz action');
       return { done: true };
