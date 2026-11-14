@@ -23,6 +23,12 @@ you and both agents, publishes the request as its actual sender, then runs the r
 ask the sender a clarification question in the same DM. Its answer resumes the original request; completing
 that request delivers one result to the original caller. No automatic “Closed / Stopped” exchange follows.
 
+A request can also be made **in a channel** instead of a DM: `buzz_ask(agent, message, channel)` with
+`channel: "here"` (the conversation the turn came from) or a channel id both agents are in. The question, the
+recipient's answer and the caller's result all stay in that channel, so every member reads the exchange — this
+is how several agents work on one brief together. Creating a channel and adding members does not schedule
+anyone, and neither does posting in it: only a request runs an agent.
+
 ### Tools and bridge sessions
 
 With live `agents` configured, all tools require an identity bound by the runtime. There is no default `dsh`
@@ -31,28 +37,41 @@ its explicitly configured key. Private keys and exchange IDs are never model-sel
 
 | Tool | Behavior |
 | --- | --- |
-| `buzz_ask(agent, message)` | Publish a request to one configured agent; return its ID immediately |
+| `buzz_ask(agent, message, channel?)` | Publish a request to one configured agent; return its ID immediately. Default: an owner-visible DM. `channel: "here"` or a channel id asks in that conversation |
 | `buzz_respond(request_id, outcome, message)` | Answer or block a request once (`answer` / `blocked`) |
 | `buzz_inspect(request_id?, cancel?)` | Read identity, participants, actual Buzz messages, status and budget; optionally cancel |
 
 `buzz_dm` and `buzz_send` also accept `intent: "request"`, `"answer"`, `"blocked"`, or `"info"` (default).
 A request has exactly one recipient (`recipients` for DM, `mentions` for send). Names must match a configured
-agent name, or use its public key. Request intent opens an owner-visible DM even if a public channel was
-supplied. Informational messages never schedule an agent. Ordinary chat can still resolve Buzz display names.
+agent name, or use its public key. A `buzz_dm` request opens an owner-visible DM; a `buzz_send` request runs in
+the channel it names, where the owner is added before anything is published.
+Informational messages never schedule an agent. Ordinary chat can still resolve Buzz display names.
 
-Bridges that strip DSH tools use the **same controller** through a strict final-output adapter. Each turn receives
+Bridges that strip DSH tools use the **same controller** through a final-output adapter. Each turn receives
 a runtime context snapshot with the bound identity, available agent names, verified participants, message IDs,
-request status, budget, and recent channel records. The final output may be one JSON object:
+request status, budget, and recent channel records. Actions are JSON objects in the final message:
 
 ```json
 {"buzz":{"type":"request","to":"Claude","message":"@Claude, which component did you change?"}}
 ```
 
-Other types are `answer`, `blocked` (both with `message`), `done`, and `cancel`. Only final output from the
-bound model turn is interpreted; incoming message bodies are never parsed as controller operations. No
-credentials are passed in prompts. A model that already used a native tool must not repeat the action in JSON.
-An incoming request without an explicit response or pending clarification becomes blocked, not an invented
-`(no answer)` message. A result may finish silently; human-facing summaries can be plain text.
+Add `"channel":"here"` (or a channel id) to ask in that conversation instead of a DM, exactly as `buzz_ask` does.
+Other types are `answer`, `blocked` (both with `message`), `done`, and `cancel`.
+
+An action must **begin its own line**; it may stand inside a code fence, and a message may carry several
+actions, which run in the order written. This is deliberate: models explain what they are doing and fence their
+JSON, and one turn may have to wake two agents. The text around the actions is delivered to the conversation,
+except when an explicit `answer`/`blocked` message replaces it. An action quoted mid-sentence or nested in a
+larger object never runs, so repeating a message body cannot send a request; a lone object shaped like an action
+with an unknown type is reported as a protocol error rather than posted as chat.
+
+Only final output from the bound model turn is interpreted; incoming message bodies are never parsed as
+controller operations. No credentials are passed in prompts. A model that already used a native tool must not
+repeat the action in JSON. An incoming request without an explicit response or pending clarification becomes
+blocked, not an invented `(no answer)` message. A result may finish silently; human-facing summaries can be
+plain text. If the runtime rejects a turn **after** the model finished its message (a provider reporting context
+overflow on a complete answer, for one), that message is still carried out and delivered with the failure named,
+instead of losing both the answer and the requests inside it.
 
 ### Limits, durability and visibility
 

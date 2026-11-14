@@ -209,7 +209,10 @@ async function sendMessage({ channel, content, reply_to, mentions, direct = fals
     if (!controller || !ctx) throw new Error('Explicit requests require a bound DSH Buzz conversation');
     if (intent === 'request') {
       if (!Array.isArray(mentions) || mentions.length !== 1) throw new Error('A request requires exactly one recipient');
-      return JSON.stringify(await controller.ask(ctx, mentions[0], content));
+      // A request named a channel: ask there, so the members read the question and the answer.
+      // Without a channel (every buzz_dm request) it is an owner-visible DM, as before.
+      return JSON.stringify(await controller.ask(ctx, mentions[0], content,
+        { channel: direct || channel === undefined || channel === null || channel === '' ? undefined : await channelId(channel) }));
     }
     return JSON.stringify(await controller.respond(ctx, request_id || ctx.requestId, intent, content));
   }
@@ -299,7 +302,7 @@ export const TOOLS = [
     inputSchema: { type: "object", properties: {
       channel: str("Channel name (e.g. general) or UUID"),
       content: str("Message text"),
-      intent: { enum: ["info", "request", "answer", "blocked"], description: "Default info does not schedule agents. request requires one configured agent in mentions; it opens an owner-visible DM." },
+      intent: { enum: ["info", "request", "answer", "blocked"], description: "Default info does not schedule agents. request requires one configured agent in mentions and runs it in this channel, where every member reads the question and the answer." },
       request_id: str("Request being answered"),
       reply_to: str("Optional: id of the message you are replying to"),
       mentions: { type: "array", items: { type: "string" }, description: "Optional: display names or public keys of the people or agents to notify" } }, required: ["channel", "content"] },

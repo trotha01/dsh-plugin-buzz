@@ -190,3 +190,53 @@ test('plugin bridge path opens an owner-visible request and routes structured an
     assert.throws(()=>who.execute({}, {agent:{session:{id:'unbound-bridge'}}}),/not bound/);
   }finally{dispose?.();await new Promise(r=>setTimeout(r,20));globalThis.WebSocket=original;rmSync(dir,{recursive:true,force:true});}
 });
+
+test('a turn that fails after its message still wakes the named agents in the channel',async()=>{
+  const {mkdtempSync,writeFileSync,rmSync}=await import('node:fs');
+  const {tmpdir}=await import('node:os');const {join}=await import('node:path');
+  const {setRunner,pubkeyOf}=await import('../buzz-mcp.mjs');const {signEvent}=await import('../listen.mjs');
+  const dir=mkdtempSync(join(tmpdir(),'buzz-plugin-channel-'));
+  const ownerKey='33'.repeat(32),owner=pubkeyOf(ownerKey),grok=pubkeyOf('11'.repeat(32)),claude=pubkeyOf('22'.repeat(32));
+  const channel='a6f725b6-ce62-477e-bb7c-3b041b00a32f';
+  const agents=[['Grok','11'.repeat(32)],['Claude','22'.repeat(32)]].map(([name,key])=>{
+    const keyFile=join(dir,name);writeFileSync(keyFile,key,{mode:0o600});return {name,keyFile,provider:'bridge',model:name};
+  });
+  const cli=join(dir,'cli');writeFileSync(cli,`#!${process.execPath}\nconsole.log(JSON.stringify(process.argv.includes('members')?[{pubkey:'${owner}'}]:{event_id:'${'ab'.repeat(32)}'}));`,{mode:0o700});
+  const posts=[],dms=[],registered=[],sockets=[];let dispose;
+  setRunner(async(args,text)=>{
+    if(args[0]==='dms'){dms.push(args);return JSON.stringify({channel_id:channel});}
+    if(args[1]==='members')return JSON.stringify([grok,claude,owner].map(pubkey=>({pubkey})));
+    if(args[1]==='send'){posts.push({text,args});return JSON.stringify({event_id:String(posts.length).padStart(64,'0')});}
+    return '[]';
+  });
+  const sessions=new Map();
+  const service={get:id=>sessions.get(id),resume:async()=>{throw Error('new');},create:async({sessionId})=>{
+    const events=[];const agent={status:'idle',session:{get seq(){return events.length;},eventAt:i=>events[i]},whenIdle:async()=>{},
+      followup:message=>{
+        const prompt=message.content[0].text;
+        const human=prompt.includes('"kind":"human"');
+        const text=human?['Asking Claude in this channel.','```json',
+          JSON.stringify({buzz:{type:'request',to:'Claude',message:'What changed?',channel:'here'}}),'```'].join('\n')
+          :prompt.includes('"kind":"request"')?JSON.stringify({buzz:{type:'answer',message:'Buzz changed.'}}):'Done.';
+        events.push({type:'assistant/message',data:{message:{content:[{type:'text',text}]}}});
+        // The human turn is rejected by the provider after the model finished its message.
+        if(human)events.push({type:'turn/end',data:{reason:{kind:'error'}}});
+      }};sessions.set(sessionId,agent);return {agent};
+  }};
+  const original=globalThis.WebSocket;
+  globalThis.WebSocket=class{constructor(){this.h={};sockets.push(this);}addEventListener(t,f){this.h[t]=f;}send(){}close(){}};
+  try{
+    await apply({tools:{register:t=>registered.push(t)},get:n=>n==='agents'?service:undefined,
+      logger:()=>({info(){},warn(){}}),on:(name,fn)=>{if(name==='dispose')dispose=fn;return ()=>{};}},
+      {keyFile:agents[0].keyFile,relayUrl:'https://relay.example',ownerPubkey:owner,allowFrom:[owner],agents,cliPath:cli});
+    const e=signEvent(ownerKey,{kind:9,tags:[['h',channel],['p',grok]],content:'Ask Claude what changed, here'});
+    sockets[0].h.message({data:JSON.stringify(['EVENT','messages',e])});
+    for(let i=0;i<200&&posts.length<3;i++)await new Promise(r=>setTimeout(r,10));
+    assert.deepEqual(posts.map(p=>p.text),['What changed?','Buzz changed.','Done.']);
+    // The request was asked in the channel the human wrote in, addressed to Claude: no private DM.
+    assert.equal(dms.length,0);
+    assert.ok(posts[0].args.includes('--channel')&&posts[0].args.includes(channel));
+    assert.equal(posts[0].args[posts[0].args.indexOf('--mention')+1],claude);
+    assert.equal(posts[1].args[posts[1].args.indexOf('--channel')+1],channel);
+  }finally{dispose?.();await new Promise(r=>setTimeout(r,20));globalThis.WebSocket=original;rmSync(dir,{recursive:true,force:true});}
+});

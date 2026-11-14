@@ -45,3 +45,15 @@ test('natural DM request and answer intents use the shared controller; info stay
   assert.equal(calls[0][0],'ask');assert.equal(calls[0][2],'Claude');assert.equal(calls[1][0],'respond');
   await assert.rejects(withIdentity({},()=>dm.run({recipients:['Claude'],content:'test',intent:'request'})),/bound DSH/);
 });
+
+test('a channel request runs in that channel; a DM request still opens a DM',async()=>{
+  const calls=[];
+  const identity={requestContext:{actor:'grok'},requestController:{
+    ask:async(...args)=>{calls.push(args);return {request_id:'r'};},
+  }};
+  const send=TOOLS.find(t=>t.name==='buzz_send'),dm=TOOLS.find(t=>t.name==='buzz_dm');
+  await withIdentity(identity,()=>send.run({channel,content:'@Claude investigate',mentions:['Claude'],intent:'request'}));
+  assert.deepEqual(calls[0][3],{channel});
+  await withIdentity(identity,()=>dm.run({recipients:['Claude'],content:'@Claude investigate',intent:'request'}));
+  assert.deepEqual(calls[1][3],{channel:undefined});
+});
