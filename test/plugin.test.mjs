@@ -96,7 +96,7 @@ test("duplicate names or keys cannot silently select another agent's identity", 
   };
   try {
     await apply({ logger: () => ({ info: m => logs.push(m), warn: m => warnings.push(m) }),
-      plugin() {}, on: (_, fn) => { dispose = fn; } }, {
+      plugin() {}, effect: fn => { dispose = fn(); } }, {
       relayUrl: "https://relay.example", allowFrom: ["33".repeat(32)], agents: [
         { name: "first", keyFile: first, provider: "p", model: "m" },
         { name: "first", keyFile: second, provider: "p", model: "m" },
@@ -178,7 +178,7 @@ test('plugin bridge path opens an owner-visible request and routes structured an
   globalThis.WebSocket=class{constructor(){this.h={};sockets.push(this);}addEventListener(t,f){this.h[t]=f;}send(){}close(){}};
   try{
     await apply({tools:{register:t=>registered.push(t)},get:n=>n==='agents'?service:undefined,
-      logger:()=>({info(){},warn(){}}),on:(name,fn)=>{if(name==='dispose')dispose=fn;return ()=>{};}},
+      logger:()=>({info(){},warn(){}}),effect:fn=>{dispose=fn();},on:()=>()=>{}},
       {keyFile:agents[0].keyFile,relayUrl:'https://relay.example',ownerPubkey:owner,allowFrom:[owner],agents,cliPath:cli});
     const e=signEvent(ownerKey,{kind:9,tags:[['h',channel],['p',grok]],content:'Ask Claude what changed'});
     sockets[0].h.message({data:JSON.stringify(['EVENT','messages',e])});
@@ -189,4 +189,35 @@ test('plugin bridge path opens an owner-visible request and routes structured an
     const who=registered.find(t=>t.name==='mcp__buzz__buzz_whoami');
     assert.throws(()=>who.execute({}, {agent:{session:{id:'unbound-bridge'}}}),/not bound/);
   }finally{dispose?.();await new Promise(r=>setTimeout(r,20));globalThis.WebSocket=original;rmSync(dir,{recursive:true,force:true});}
+});
+
+test('real Cordis disposal closes Buzz sockets, including failed setup', {skip: !process.env.BUZZ_TEST_CORDIS}, async () => {
+  const {Context} = await import(process.env.BUZZ_TEST_CORDIS);
+  const {mkdtempSync,writeFileSync,rmSync} = await import('node:fs');
+  const {tmpdir} = await import('node:os');
+  const dir=mkdtempSync(`${tmpdir()}/buzz-lifecycle-`), keyFile=`${dir}/key`;
+  writeFileSync(keyFile,'11'.repeat(32),{mode:0o600});
+  const original=globalThis.WebSocket, sockets=[];
+  globalThis.WebSocket=class {
+    constructor(){this.closed=false;sockets.push(this);}
+    addEventListener(){} send(){} close(){this.closed=true;}
+  };
+  try {
+    for (const fail of [false,true]) {
+      const root=new Context(); let complete;
+      const ready=new Promise(resolve=>complete=resolve);
+      const fiber=root.plugin(async ctx=>{
+        try {
+          await apply(ctx,{relayUrl:'https://relay.example',explicitRequests:false,
+            agents:[{name:'Lifecycle',keyFile,provider:'p',model:'m'}]});
+          if(fail) throw new Error('setup failed after listener creation');
+        } finally { complete(); }
+      });
+      await ready;
+      if(!fail) assert.equal(sockets.at(-1).closed,false);
+      await fiber.dispose();
+      assert.equal(sockets.at(-1).closed,true);
+      await root.fiber.dispose();
+    }
+  } finally {globalThis.WebSocket=original;rmSync(dir,{recursive:true,force:true});}
 });

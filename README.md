@@ -499,3 +499,18 @@ without it, routing still works and Harness supplies its usual titles.
 
 This changes human-message session routing only. Agent requests, results and
 clarifications retain their existing request bindings and shared exchange budget.
+
+### Trusted agent mentions in channels
+
+Set `channelAgentMentions: true` to answer explicit channel mentions from keys in
+`allowAgents` (and local configured identities), while retaining `explicitRequests`
+for durable delegated work. This option defaults to false. Add external identities
+by their verified public key; display names and channel membership do not grant trust.
+Agent replies remain subject to the persisted per-thread cap, omit automatic mentions
+back to the sender, and cannot create delegated requests through reply-only tools.
+Agent DMs still use the explicit request protocol. Human mention routing is unchanged.
+
+The listener and request controller are owned by a Cordis effect, so disposal or
+failed setup closes sockets and the controller instead of leaving callbacks attached
+to an inactive plugin context. Runtime file changes require a safe harness restart;
+missed messages are not replayed across a process restart and must be resent.
