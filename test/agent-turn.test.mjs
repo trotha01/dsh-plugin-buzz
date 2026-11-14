@@ -147,3 +147,22 @@ test('Buzz titles are set before input, persist on replies, and respect manual r
   await answer('',{threadKey:'request',sessionTopic:'Review the channel fix'});
   assert.equal(receivedTitle,'Review the channel fix');
 });
+
+test('a finished message travels on the failure, and only on a real one', async () => {
+  const events = [
+    {type:'assistant/message',data:{message:{content:[{type:'text',text:'{"buzz":{"type":"request","to":"Grok","message":"go"}}'}]}}},
+    {type:'turn/end',data:{reason:{kind:'error'}}},
+  ];
+  const session = {get seq(){return events.length;},eventAt:i=>events[i]};
+  // The provider rejected a message the model had already completed: the text is kept on the error so
+  // the request controller can still carry out the actions in it.
+  const thrown = () => { try { finalText(session,0); } catch (err) { return err; } throw new Error('finalText did not report the failure'); };
+  const failure = thrown();
+  assert.match(failure.message, /The model turn failed/);
+  assert.equal(failure.finalText,'{"buzz":{"type":"request","to":"Grok","message":"go"}}');
+  // An interrupted turn carries its text too, and a successful turn still just returns it.
+  events[1] = {type:'turn/end',data:{reason:{kind:'interrupted'}}};
+  assert.equal(thrown().finalText,'{"buzz":{"type":"request","to":"Grok","message":"go"}}');
+  events[1] = {type:'turn/end',data:{reason:{kind:'stop'}}};
+  assert.equal(finalText(session,0),'{"buzz":{"type":"request","to":"Grok","message":"go"}}');
+});
