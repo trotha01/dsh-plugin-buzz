@@ -27,7 +27,8 @@ export const Config = Schema.object({
   serverName: Schema.string().default('buzz').description('Tool namespace: tools appear as mcp__<serverName>__buzz_send'),
   ownerPubkey: Schema.string().default('').description('Human owner public key. Added to every conversation before agent messages are sent; sends fail closed if membership cannot be confirmed. Default: $BUZZ_OWNER_PUBKEY'),
   allowFrom: Schema.array(Schema.string()).default([]).description('Buzz public keys (64-character hex) whose messages the agents below answer. Empty: they answer nobody'),
-  allowAgents: Schema.array(Schema.string()).default([]).description('Other agent public keys recognized for owner-visible DMs. Automatic mention replies apply only in legacy mode'),
+  allowAgents: Schema.array(Schema.string()).default([]).description('Trusted agent public keys for owner-visible DMs and optional channel mention replies'),
+  channelAgentMentions: Schema.boolean().default(false).description('Answer explicit channel mentions from allowAgents while keeping durable requests enabled'),
   explicitRequests: Schema.boolean().default(true).description('Use explicit, durable agent requests instead of automatic agent replies'),
   requestStore: Schema.string().default('').description('SQLite request ledger path; defaults beside the first agent key'),
   maxAgentReplies: Schema.natural().default(10).description('Shared request budget per originating human event (maximum 10); legacy mode uses per-thread reply caps'),
@@ -154,10 +155,19 @@ export async function apply(ctx, config = {}) {
   const allowFrom = (config.allowFrom || []).map((s) => s.trim().toLowerCase()).filter((s) => HEX64.test(s))
   if (!allowFrom.length) warn('Buzz agents answer no humans until allowFrom lists at least one public key')
   if (allowFrom.length !== (config.allowFrom || []).length) warn('Invalid allowFrom entries ignored: use 64-character hex public keys, not names or npub strings')
+  const live = []
+  let controller, disposed = false
+  // Cordis owns effects; there is no lifecycle event named "dispose".
+  // Register before asynchronous setup so failed or interrupted setup also cleans up.
+  ctx.effect(() => () => {
+    disposed = true
+    for (const c of live) { c.close(); if (LISTENERS.get(c.me) === c) LISTENERS.delete(c.me) }
+    return controller?.close()
+  }, 'buzz.listeners')
   const deps = await dshDeps()
+  if (disposed) return
   const cli = config.cliPath || process.env.BUZZ_CLI || ''
   const cwd = config.cwd || process.cwd()
-  const live = []
   const keys = new Map()
   const usedNames = new Set(), usedKeys = new Set()
   for (const a of agents) {
@@ -179,12 +189,11 @@ export async function apply(ctx, config = {}) {
     BUZZ_RELAY_URL: relayUrl, BUZZ_CLI: cli, BUZZ_OWNER_PUBKEY: ownerPubkey, agentPubkeys: allowAgents,
   }]))
   const answerers = new Map()
-  let controller
   for (const [a, key] of keys) {
     const actor = pubkeyOf(key)
     answerers.set(actor, makeAnswerer(ctx, { ...a, cwd: a.cwd || cwd }, { ...deps,
       bindIdentity: (agent, event, requestContext) => identities.set(agent, {
-        ...configured.get(actor), requestContext, requestController: controller, replyOnly: !explicitRequests && allowAgents.includes(event?.pubkey),
+        ...configured.get(actor), requestContext, requestController: controller, replyOnly: allowAgents.includes(event?.pubkey),
       }), images: event => eventImages(event, { secretHex: key, relayUrl }),
     }))
   }
@@ -216,17 +225,29 @@ export async function apply(ctx, config = {}) {
     if (!secretHex) continue
     const actor = pubkeyOf(secretHex)
     const conn = listen({
-      name: a.name, relayUrl, secretHex, allowFrom, allowAgents, maxAgentReplies, ownerPubkey, explicitRequests,
+      name: a.name, relayUrl, secretHex, allowFrom, allowAgents, maxAgentReplies, ownerPubkey, explicitRequests, channelAgentMentions: config.channelAgentMentions === true,
       beforeAnswer: makeVisibilityGuard({ relayUrl, keyFile: a.keyFile, cli, ownerPubkey }),
       answer: async (text, options) => {
-        if (!controller) return answerers.get(actor)(text, options)
+        if (!controller || allowAgents.includes(options.event?.pubkey)) return answerers.get(actor)(text, options)
         const binding = controller.start({ actor, owner: ownerPubkey, origin: options.event.id, threadKey: options.threadKey,
           channel: options.event.tags.find(t => t[0] === 'h')[1], replyTo: options.event.id, human: options.event.pubkey === ownerPubkey })
         const snapshot = await controller.inspect(binding)
-        const result = await answerers.get(actor)(text, { ...options, onProgress: undefined,
-          requestContext: binding, runtimePrompt: requestPrompt('human', snapshot) + '\n\nHuman message:\n' })
+        let result, failure
+        try {
+          result = await answerers.get(actor)(text, { ...options, onProgress: undefined,
+            requestContext: binding, runtimePrompt: requestPrompt('human', snapshot) + '\n\nHuman message:\n' })
+        } catch (err) {
+          // A turn can fail after the model has already finished its message (a provider reporting
+          // context overflow on a completed answer, for one). Throwing here would also throw away the
+          // agent requests in that message, so the finished text is still carried out and delivered
+          // with the failure named, instead of only "(could not answer)".
+          if (typeof err?.finalText !== 'string' || !err.finalText.trim()) throw err
+          result = err.finalText
+          failure = String(err?.message || err)
+        }
         const output = await controller.finish(binding, result)
-        return output?.text || ''
+        return [output?.text, failure && `(${a.name}: the model turn reported a failure after this message: ${failure})`]
+          .filter(t => t && t.trim()).join('\n\n')
       },
       send: makeSender({ relayUrl, keyFile: a.keyFile, cli, ownerPubkey }),
       store: threadStore(a.keyFile),
@@ -239,5 +260,4 @@ export async function apply(ctx, config = {}) {
     say(`Buzz agent ${a.name} (${a.provider}/${a.model}) listening as ${conn.me}`)
     live.push(conn)
   }
-  ctx.on?.('dispose', () => { void controller?.close(); for (const c of live) { c.close(); if (LISTENERS.get(c.me) === c) LISTENERS.delete(c.me) } })
 }

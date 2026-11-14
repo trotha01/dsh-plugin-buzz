@@ -60,7 +60,7 @@ export function route(e, { me, allowFrom, allowAgents = new Set(), dmChannels, t
  * One identity's live connection. `answer(text, ctx)` returns the reply text; `send(reply)` posts it.
  * Reconnects with backoff and resubscribes from the last event seen, so a dropped socket loses nothing.
  */
-export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [], maxAgentReplies = 10, ownerPubkey, beforeAnswer = async () => {}, explicitRequests = false, answer, send, log, store, WebSocketImpl = globalThis.WebSocket, now = () => Date.now(), statusIntervalMs = 60_000 }) {
+export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [], maxAgentReplies = 10, ownerPubkey, beforeAnswer = async () => {}, explicitRequests = false, channelAgentMentions = false, answer, send, log, store, WebSocketImpl = globalThis.WebSocket, now = () => Date.now(), statusIntervalMs = 60_000 }) {
   const me = bytesToHex(schnorr.getPublicKey(hexToBytes(secretHex)));
   const url = wsUrl(relayUrl);
   const allow = new Set(allowFrom);
@@ -100,7 +100,9 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
     seen.add(e.id); if (seen.size > 5000) seen.delete(seen.values().next().value);
     if (e.created_at > since) since = e.created_at;
     const r = route(e, { me, allowFrom: allow, allowAgents: agentsAllowed, dmChannels, threads });
-    if (!r || (explicitRequests && r.fromAgent)) return;
+    if (!r) return;
+    if (explicitRequests && r.fromAgent && !(channelAgentMentions &&
+        !dmChannels.has(r.channel) && tagValues(e, "p").includes(me))) return;
     if (r.fromAgent) {
       const n = agentReplies.get(r.threadKey) ?? 0;
       if (n >= limit) return void log({ event: "buzz_agent_cap", agent: name, thread: r.threadKey.slice(0, 12), replies: n });
@@ -117,7 +119,7 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
       const pending = delivery.then(async () => {
         if (closed || !text || (modelText && text === lastModelText)) return;
         const id = await send({ channel: r.channel, replyTo: r.replyTo,
-          mention: e.pubkey, text });
+          mention: explicitRequests && r.fromAgent ? undefined : e.pubkey, text });
         if (id) remember(id, r.threadKey);
         lastActivity = now();
         if (modelText) lastModelText = text;
