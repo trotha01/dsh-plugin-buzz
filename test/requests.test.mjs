@@ -26,6 +26,30 @@ function fixture(t, options = {}) {
   return { c, ctx, posts, turns, transport, verified };
 }
 
+test('structured human DM answers and blockers return text without an agent request', async t => {
+  const { c, ctx, posts } = fixture(t);
+  for (const type of ['answer', 'blocked']) {
+    assert.deepEqual(await c.finish(ctx, action(type, 'Here is my reply.')), { text: 'Here is my reply.' });
+  }
+  assert.equal(posts.length, 0); // The listener delivers this text exactly once.
+  assert.deepEqual(c.read().requests, {});
+  await assert.rejects(c.finish(ctx, action('answer', ' ')), /nonempty/);
+  c.cancel(ctx);
+  await assert.rejects(c.finish(ctx, action('answer', 'late')), /canceled or expired/);
+});
+
+test('structured caller result reaches the human DM after delegated work', async t => {
+  const { c, ctx, posts } = fixture(t, { run: async (_ctx, event) =>
+    action('answer', event.kind === 'request' ? 'Delegate answer.' : 'Final human answer.') });
+  const { request_id: id } = await c.ask(ctx, 'claude', 'Investigate.');
+  await idle(c);
+  assert.equal(c.read().requests[id].status, 'completed');
+  assert.equal(c.read().requests[id].notification, 'done');
+  assert.equal(posts.length, 3);
+  assert.equal(posts[2].channel, 'human-dm');
+  assert.equal(posts[2].text, 'Final human answer.');
+});
+
 test('owner DM -> group request -> one answer -> one caller result; no close-out loop', async t => {
   const {c,ctx,posts,turns,verified} = fixture(t);
   const {request_id:id} = await c.ask(ctx,'claude','What changed?'); await idle(c);
