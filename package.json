@@ -29,6 +29,7 @@
     "index.js",
     "buzz-mcp.mjs",
     "listen.mjs",
+    "delivery.mjs",
     "agent-turn.mjs",
     "media.mjs",
     "cordis.patch.yml",

@@ -170,3 +170,45 @@ test('deadline posts one owner notice without running another model',async t=>{
   assert.match(posts[1].text,/expired/);assert.equal(posts[1].channel,'human-dm');
   c.kick();await idle(c);assert.equal(posts.length,2);
 });
+
+test('durable request publication survives restart with same event and one recipient turn',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'buzz-request-outbox-')),file=join(dir,'requests');
+  let now=1000,offline=true,runs=0;const sent=[];
+  const transport={resolve:x=>x,open:async()=> 'channel',verify:async()=>{},read:async()=>[],
+    prepare:(actor,channel,text)=>({id:actor+':'+text,content:text}),
+    publish:async(actor,event)=>{sent.push(event.id);if(offline)throw Error('offline');return event.id;}};
+  let c=new RequestController({file,transport,now:()=>now,run:async()=>{runs++;return '';}});
+  const ctx=c.start({actor:'a',owner:'owner',origin:'origin',channel:'channel'});
+  const {request_id:id}=await c.ask(ctx,'b','work');
+  assert.equal(c.read().requests[id].status,'publishing');await c.close();
+  offline=false;now+=31000;
+  c=new RequestController({file,transport,now:()=>now,run:async()=>{runs++;return '';}});
+  c.kick();await idle(c);
+  assert.equal(runs,2); // recipient then caller notification for explicit blocker
+  assert.equal(sent[0],sent[1]);assert.equal(sent.filter(x=>x==='a:work').length,2);
+  await c.close();rmSync(dir,{recursive:true});
+});
+
+test('durable response and final result retries do not repeat either model turn',async t=>{
+  let now=1000;const failed=new Set(),attempts=[],runs=[];
+  let c;
+  const transport={resolve:x=>x,open:async()=> 'channel',verify:async()=>{},read:async()=>[],
+    prepare:(actor,channel,text)=>({id:actor+':'+text,content:text}),
+    publish:async(actor,event)=>{attempts.push(event.id);if(event.content!=='work'&&!failed.has(event.id)){failed.add(event.id);throw Error('lost ACK');}return event.id;}};
+  c=new RequestController({file:':memory:',transport,now:()=>now,run:async(ctx,{kind})=>{runs.push(kind);return kind==='request'?action('answer','answer'):'final';}});
+  t.after(()=>c.close());const ctx=c.start({actor:'a',owner:'owner',origin:'origin',channel:'channel'});
+  const {request_id:id}=await c.ask(ctx,'b','work');await idle(c);
+  assert.equal(c.read().requests[id].status,'responding');assert.deepEqual(runs,['request']);
+  now+=31000;c.kick();await idle(c);
+  assert.equal(c.read().requests[id].notification,'publishing');
+  now+=31000;c.kick();await idle(c);
+  assert.equal(c.read().requests[id].notification,'done');assert.deepEqual(runs,['request','result']);
+  assert.equal(attempts.filter(x=>x==='b:answer').length,2);assert.equal(attempts.filter(x=>x==='a:final').length,2);
+});
+
+test('caller result retains its explicit session destination',async t=>{
+  const {c,turns}=fixture(t);
+  const ctx=c.start({actor:'grok',owner:'trevor',origin:'another-message',channel:'human-dm',threadKey:'thread',sessionId:'existing-work-session'});
+  await c.ask(ctx,'claude','check');await idle(c);
+  assert.equal(turns.find(x=>x.event.kind==='result').ctx.sessionId,'existing-work-session');
+});

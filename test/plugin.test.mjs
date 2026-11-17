@@ -96,7 +96,7 @@ test("duplicate names or keys cannot silently select another agent's identity", 
   };
   try {
     await apply({ logger: () => ({ info: m => logs.push(m), warn: m => warnings.push(m) }),
-      plugin() {}, on: (_, fn) => { dispose = fn; } }, {
+      tools: {register() {}}, effect: fn => { dispose = fn(); }, plugin() {}, on: (_, fn) => { dispose = fn; } }, {
       relayUrl: "https://relay.example", allowFrom: ["33".repeat(32)], agents: [
         { name: "first", keyFile: first, provider: "p", model: "m" },
         { name: "first", keyFile: second, provider: "p", model: "m" },
@@ -175,10 +175,10 @@ test('plugin bridge path opens an owner-visible request and routes structured an
       }};sessions.set(sessionId,agent);return {agent};
   }};
   const original=globalThis.WebSocket;
-  globalThis.WebSocket=class{constructor(){this.h={};sockets.push(this);}addEventListener(t,f){this.h[t]=f;}send(){}close(){}};
+  globalThis.WebSocket=class{constructor(){this.h={};sockets.push(this);queueMicrotask(()=>this.h.open?.());}addEventListener(t,f){this.h[t]=f;}send(raw){const m=JSON.parse(raw);if(m[0]==='EVENT'){posts.push(m[1].content);queueMicrotask(()=>this.h.message?.({data:JSON.stringify(['OK',m[1].id,true,''])}));}}close(){}};
   try{
     await apply({tools:{register:t=>registered.push(t)},get:n=>n==='agents'?service:undefined,
-      logger:()=>({info(){},warn(){}}),on:(name,fn)=>{if(name==='dispose')dispose=fn;return ()=>{};}},
+      effect:fn=>{dispose=fn();},logger:()=>({info(){},warn(){}}),on:(name,fn)=>{if(name==='dispose')dispose=fn;return ()=>{};}},
       {keyFile:agents[0].keyFile,relayUrl:'https://relay.example',ownerPubkey:owner,allowFrom:[owner],agents,cliPath:cli});
     const e=signEvent(ownerKey,{kind:9,tags:[['h',channel],['p',grok]],content:'Ask Claude what changed'});
     sockets[0].h.message({data:JSON.stringify(['EVENT','messages',e])});
