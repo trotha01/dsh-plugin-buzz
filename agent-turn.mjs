@@ -7,8 +7,8 @@ import { createHash } from "node:crypto";
 export const sessionIdFor = (agentName, threadKey) =>
   `session-buzz-${createHash("sha256").update(`${agentName}\0${threadKey}`).digest("hex").slice(0, 32)}`;
 
-/** Last non-empty assistant text after `firstSeq` (same rule as dsh-headless). */
-export function finalText(session, firstSeq) {
+/** Last non-empty assistant text after `firstSeq`, with the turn outcome (same rule as dsh-headless). */
+export function assistantText(session, firstSeq) {
   let text = "";
   let reason;
   for (let seq = firstSeq; seq < session.seq; seq++) {
@@ -20,11 +20,22 @@ export function finalText(session, firstSeq) {
       if (t) text = t;
     }
   }
+  return { text, reason };
+}
+
+/** A failed turn, carrying the text the model did produce for callers that can still act on it. */
+const turnFailure = (message, text) => Object.assign(new Error(message), { finalText: text });
+
+/** Last non-empty assistant text after `firstSeq`; throws when the turn did not end successfully. */
+export function finalText(session, firstSeq) {
+  const { text, reason } = assistantText(session, firstSeq);
   // Provider failures are durable turn outcomes, not necessarily rejected whenIdle() promises.
   // Do not mistake an earlier "working on it" message for a successful final answer, or expose
-  // raw provider error bodies (which may include request details) to the chat.
-  if (reason?.kind === "error") throw new Error("The model turn failed. Check the Harness conversation for details, then retry.");
-  if (reason?.kind === "interrupted" || reason?.kind === "aborted") throw new Error("The model turn was interrupted. Please resend your request.");
+  // raw provider error bodies (which may include request details) to the chat. The text travels
+  // on the error so a caller that can tell the difference (the request controller, which reads
+  // explicit Buzz actions out of it) is not left with nothing when a finished message is rejected.
+  if (reason?.kind === "error") throw turnFailure("The model turn failed. Check the Harness conversation for details, then retry.", text);
+  if (reason?.kind === "interrupted" || reason?.kind === "aborted") throw turnFailure("The model turn was interrupted. Please resend your request.", text);
   return text;
 }
 
@@ -125,7 +136,8 @@ export function makeAnswerer(ctx, { name, provider, model, instructions = "", cw
       for (;;) {
         await agent.whenIdle();
         await progressDelivery;
-        if (failure) throw new Error("The model turn failed. Check the Harness conversation for details, then retry.");
+        if (failure) throw turnFailure("The model turn failed. Check the Harness conversation for details, then retry.",
+          assistantText({ seq: agent.session.seq, eventAt: (s) => agent.session.eventAt(deps.SessionSeq(s)) }, firstSeq).text);
         const idleSeq = agent.session.seq;
         // Publish idle-turn text before waiting for delegated work.
         const progress = finalText({ seq: idleSeq, eventAt: (s) => agent.session.eventAt(deps.SessionSeq(s)) }, firstSeq);
