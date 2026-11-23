@@ -72,14 +72,16 @@ export class RequestController {
     this.limit = Math.max(0, Math.min(10, limit));
     this.active = 0; this.closed = false;
     this.change(s => {
-      for (const e of Object.values(s.exchanges)) if (e.notice === 'running') e.notice = 'uncertain';
+      s.publications ??= {};
+      for (const p of Object.values(s.publications)) if (p.status === 'running') p.status = 'pending';
+      for (const [id, e] of Object.entries(s.exchanges)) if (e.notice === 'running') e.notice = s.publications[`notice:${id}`] ? 'publishing' : 'uncertain';
       for (const r of Object.values(s.requests)) {
         const uncertainNotification = r.notification === 'running';
-        if (['publishing', 'running', 'responding'].includes(r.status)) {
+        if (['publishing', 'running', 'responding'].includes(r.status) && !(r.status === 'publishing' && s.publications[`request:${r.id}`]) && !(r.status === 'responding' && s.publications[`response:${r.id}`])) {
           r.status = 'blocked'; r.reason = 'Interrupted work: inspect Buzz before retrying; it was not replayed.';
           r.notification = 'pending';
         }
-        if (uncertainNotification) r.notification = 'uncertain';
+        if (uncertainNotification) r.notification = s.publications[`result:${r.id}`] ? 'publishing' : 'uncertain';
       }
     });
     this.timer = setInterval(() => this.kick(), 1000); this.timer.unref?.();
@@ -90,7 +92,35 @@ export class RequestController {
     try { const s = this.read(); const result = fn(s); this.db.prepare('UPDATE ledger SET data=? WHERE id=1').run(JSON.stringify(s)); this.db.exec('COMMIT'); return result; }
     catch (e) { this.db.exec('ROLLBACK'); throw e; }
   }
-  start({ actor, owner, origin, channel, replyTo, threadKey, human = false }) {
+  async postDurable(kind, id, actor, channel, text, replyTo, mention, participants) {
+    if (!this.transport.prepare) return this.transport.post(actor, channel, text, replyTo, mention);
+    const key = `${kind}:${id}`;
+    const event = this.transport.prepare(actor, channel, text, replyTo, mention);
+    this.change(s => { s.publications[key] ??= {key, kind, id, actor, channel, participants, event, status: 'running'}; });
+    return this.publishRecord(key);
+  }
+  async publishRecord(key) {
+    const p = this.read().publications[key];
+    if (p.status === 'done') return p.event.id;
+    try {
+      await this.transport.verify(p.actor, p.channel, p.participants);
+      if (p.kind !== 'notice') { const s = this.read(); this.live(s.exchanges[s.requests[p.id].exchange]); }
+      await this.transport.publish(p.actor, p.event);
+      this.change(s => {
+        s.publications[key].status = 'done';
+        const r = s.requests[p.id];
+        if (p.kind === 'request' && r.status === 'publishing') { r.messageId = p.event.id; r.status = 'pending'; }
+        if (p.kind === 'response' && r.status === 'responding') { r.responseId = p.event.id; r.status = r.outcome === 'answer' ? 'completed' : 'blocked'; r.notification = 'pending'; }
+        if (p.kind === 'result') r.notification = 'done';
+        if (p.kind === 'notice') s.exchanges[p.id].notice = 'done';
+      });
+      return p.event.id;
+    } catch (err) {
+      this.change(s => { const row = s.publications[key]; row.status = 'pending'; row.retryAt = this.now() + 30_000; row.reason = 'publication_retry'; });
+      throw err;
+    }
+  }
+  start({ actor, owner, origin, channel, replyTo, threadKey, sessionId, human = false }) {
     if (!actor || !owner || !origin) throw new Error('Runtime identity, owner and user event are required');
     const exchange = origin;
     this.change(s => {
@@ -98,7 +128,7 @@ export class RequestController {
       if (e.owner !== owner || e.delivered?.[actor]) throw new Error('This human event was already delivered; do not replay it');
       (e.delivered ??= {})[actor] = true;
     });
-    return { actor, owner, exchange, channel, replyTo, threadKey, human };
+    return { actor, owner, exchange, channel, replyTo, threadKey, sessionId, human };
   }
   authorize(s, ctx, id) {
     const e = s.exchanges[ctx.exchange], r = id && s.requests[id];
@@ -136,9 +166,9 @@ export class RequestController {
       const channel = target ?? await this.transport.open(ctx.actor, recipient, ctx.owner);
       await this.transport.verify(ctx.actor, channel, [ctx.actor, recipient, ctx.owner]);
       this.change(s => { this.live(s.exchanges[ctx.exchange]); s.requests[id].channel = channel; });
-      const messageId = await this.transport.post(ctx.actor, channel, message, undefined, recipient);
+      const messageId = await this.postDurable('request', id, ctx.actor, channel, message, undefined, recipient, [ctx.actor, recipient, ctx.owner]);
       this.change(s => { const r = s.requests[id]; r.messageId = messageId; if (r.status === 'publishing') r.status = 'pending'; });
-    } catch (err) { this.fail(id, 'Request publication failed or is uncertain; inspect Buzz before retrying.'); throw err; }
+    } catch (err) { if (this.read().publications?.[`request:${id}`]) return {request_id: id, status: 'publishing'}; this.fail(id, 'Request publication failed or is uncertain; inspect Buzz before retrying.'); throw err; }
     this.kick();
     return { request_id: id, status: this.read().requests[id].status };
   }
@@ -152,14 +182,14 @@ export class RequestController {
       const { e, r } = this.authorize(s, ctx, id); this.live(e);
       if (r.recipient !== ctx.actor || !['running', 'waiting'].includes(r.status)) throw new Error('Only the active recipient can respond once');
       if (Object.values(s.requests).some(c => c.caller.requestId === id && !terminal(c))) throw new Error('Wait for outstanding clarification requests before answering');
-      r.status = 'responding'; return r;
+      r.status = 'responding'; r.response = message; r.outcome = outcome; return r;
     });
     try {
       await this.transport.verify(ctx.actor, r.channel, [r.caller.actor, r.recipient, ctx.owner]);
       this.live(this.read().exchanges[r.exchange]);
-      const responseId = await this.transport.post(ctx.actor, r.channel, message, r.messageId, r.caller.actor);
+      const responseId = await this.postDurable('response', id, ctx.actor, r.channel, message, r.messageId, r.caller.actor, [r.caller.actor, r.recipient, ctx.owner]);
       this.change(s => { const current = s.requests[id]; current.response = message; current.responseId = responseId; if (current.status !== 'responding') return; current.status = outcome === 'answer' ? 'completed' : 'blocked'; current.notification = 'pending'; });
-    } catch (err) { this.fail(id, 'Response publication failed or is uncertain; inspect Buzz before retrying.'); throw err; }
+    } catch (err) { if (this.read().publications?.[`response:${id}`]) return {request_id: id, status: 'responding'}; this.fail(id, 'Response publication failed or is uncertain; inspect Buzz before retrying.'); throw err; }
     this.kick(); return { request_id: id, status: this.read().requests[id].status };
   }
   async inspect(ctx, id = ctx.requestId) {
@@ -234,6 +264,11 @@ export class RequestController {
     });
     while (this.active < this.concurrency) {
       const job = this.change(s => {
+        for (const p of Object.values(s.publications || {})) {
+          const e = p.kind === 'notice' ? s.exchanges[p.id] : s.exchanges[s.requests[p.id].exchange];
+          if (p.kind !== 'notice' && (e.canceled || e.deadline <= this.now())) { if (p.status === 'pending') p.status = 'expired'; continue; }
+          if (p.status === 'pending' && (p.retryAt || 0) <= this.now()) { p.status = 'running'; return {id: p.key, kind: 'publication'}; }
+        }
         for (const [id, e] of Object.entries(s.exchanges)) if (e.notice === 'pending') { e.notice = 'running'; return { id, kind: 'notice' }; }
         for (const r of Object.values(s.requests)) {
           const e = s.exchanges[r.exchange]; if (e.canceled || e.deadline <= this.now()) continue;
@@ -247,13 +282,14 @@ export class RequestController {
     }
   }
   async dispatch({ id, kind }) {
+    if (kind === 'publication') { await this.publishRecord(id); return; }
     if (kind === 'notice') {
       const e = this.read().exchanges[id];
       try {
         await this.transport.verify(e.actor, e.channel, [e.actor, e.owner]);
-        await this.transport.post(e.actor, e.channel, e.reason, e.replyTo);
+        await this.postDurable('notice', id, e.actor, e.channel, e.reason, e.replyTo, undefined, [e.actor, e.owner]);
         this.change(s => { s.exchanges[id].notice = 'done'; });
-      } catch { this.change(s => { s.exchanges[id].notice = 'uncertain'; }); this.log(`Owner notice failed for ${id}; inspect the ledger`); }
+      } catch { this.change(s => { s.exchanges[id].notice = s.publications?.[`notice:${id}`] ? 'publishing' : 'uncertain'; }); this.log(`Owner notice failed for ${id}; inspect the ledger`); }
       return;
     }
     const r = this.read().requests[id];
@@ -278,7 +314,7 @@ export class RequestController {
       if (kind === 'result' && !ctx.requestId && body.trim()) {
         this.live(this.read().exchanges[r.exchange]);
         await this.transport.verify(ctx.actor, ctx.channel, [ctx.actor, ctx.owner]);
-        await this.transport.post(ctx.actor, ctx.channel, body, ctx.replyTo);
+        await this.postDurable('result', id, ctx.actor, ctx.channel, body, ctx.replyTo, undefined, [ctx.actor, ctx.owner]);
       }
       const currentId = ctx.requestId;
       if (currentId) this.change(s => {
@@ -291,7 +327,7 @@ export class RequestController {
       });
     } catch (err) {
       if (kind === 'request') this.fail(id, 'Recipient could not complete the request; inspect its session.');
-      else { this.change(s => { s.requests[id].notification = 'uncertain'; }); this.log(`Result delivery failed for ${id}; not automatically replayed`); }
+      else { this.change(s => { s.requests[id].notification = s.publications?.[`result:${id}`] ? 'publishing' : 'uncertain'; }); this.log(`Result delivery failed for ${id}; not automatically replayed`); }
     } finally {
       if (kind === 'result') this.change(s => { if (s.requests[id].notification === 'running') s.requests[id].notification = 'done'; });
     }

@@ -77,21 +77,22 @@ export async function userContent(ctx, { provider, model }, body, images = [], f
  * installModelSelection, brandString, SessionSeq, and optionally images(event) -> { images, failed } for Buzz
  * attachments), injected so tests run without dsh.
  */
-export function makeAnswerer(ctx, { name, provider, model, instructions = "", cwd }, deps) {
+export function makeAnswerer(ctx, { name, provider, model, instructions = "", cwd, sessionBindings = [] }, deps) {
   const selection = { provider, model };
   const setup = (agentCtx, agent) => {
     if (agent.model.current()?.model !== model || agent.model.current()?.provider !== provider) agent.model.select({ ...selection });
     deps.installModelSelection(agentCtx);
   };
   const queues = new Map();
-  const answer = async (text, { threadKey, onProgress, event, requestContext, runtimePrompt, beforeTurn, sessionTopic }) => {
+  const destination = options => options.sessionId || sessionBindings.find(b => b.threadKey === options.threadKey)?.sessionId || sessionIdFor(name, options.threadKey);
+  const answer = async (text, { threadKey, sessionId: requestedSessionId, onProgress, event, requestContext, runtimePrompt, beforeTurn, sessionTopic }) => {
     const agents = ctx.get("agents");
     if (!agents) throw new Error("dsh agents service is not available");
-    const sessionId = deps.brandString(sessionIdFor(name, threadKey));
+    const sessionId = deps.brandString(destination({threadKey, sessionId: requestedSessionId}));
     let agent = agents.get(sessionId);
     if (!agent) {
       try { ({ agent } = await agents.resume({ resumeSessionId: sessionId, agentOptions: { ...selection }, setup })); }
-      catch { ({ agent } = await agents.create({ sessionId, meta: { cwd }, agentOptions: { ...selection }, setup })); }
+      catch (err) { if (sessionId !== sessionIdFor(name, threadKey)) throw new Error('Bound session could not be resumed'); ({ agent } = await agents.create({ sessionId, meta: { cwd }, agentOptions: { ...selection }, setup })); }
     }
     await agent.whenIdle();
     await beforeTurn?.();
@@ -153,7 +154,7 @@ export function makeAnswerer(ctx, { name, provider, model, instructions = "", cw
     }
   };
   return (text, options) => {
-    const key = options.threadKey;
+    const key = destination(options);
     const pending = (queues.get(key) || Promise.resolve()).catch(() => {}).then(() => answer(text, options));
     queues.set(key, pending);
     void pending.finally(() => { if (queues.get(key) === pending) queues.delete(key); }).catch(() => {});

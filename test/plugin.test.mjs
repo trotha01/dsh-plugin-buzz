@@ -96,7 +96,7 @@ test("duplicate names or keys cannot silently select another agent's identity", 
   };
   try {
     await apply({ logger: () => ({ info: m => logs.push(m), warn: m => warnings.push(m) }),
-      plugin() {}, effect: fn => { dispose = fn(); } }, {
+      tools: {register() {}}, effect: fn => { dispose = fn(); }, plugin() {}, on: (_, fn) => { dispose = fn; } }, {
       relayUrl: "https://relay.example", allowFrom: ["33".repeat(32)], agents: [
         { name: "first", keyFile: first, provider: "p", model: "m" },
         { name: "first", keyFile: second, provider: "p", model: "m" },
@@ -175,10 +175,10 @@ test('plugin bridge path opens an owner-visible request and routes structured an
       }};sessions.set(sessionId,agent);return {agent};
   }};
   const original=globalThis.WebSocket;
-  globalThis.WebSocket=class{constructor(){this.h={};sockets.push(this);}addEventListener(t,f){this.h[t]=f;}send(){}close(){}};
+  globalThis.WebSocket=class{constructor(){this.h={};sockets.push(this);queueMicrotask(()=>this.h.open?.());}addEventListener(t,f){this.h[t]=f;}send(raw){const m=JSON.parse(raw);if(m[0]==='EVENT'){posts.push(m[1].content);queueMicrotask(()=>this.h.message?.({data:JSON.stringify(['OK',m[1].id,true,''])}));}}close(){}};
   try{
     await apply({tools:{register:t=>registered.push(t)},get:n=>n==='agents'?service:undefined,
-      logger:()=>({info(){},warn(){}}),effect:fn=>{dispose=fn();},on:()=>()=>{}},
+      effect:fn=>{dispose=fn();},logger:()=>({info(){},warn(){}}),on:(name,fn)=>{if(name==='dispose')dispose=fn;return ()=>{};}},
       {keyFile:agents[0].keyFile,relayUrl:'https://relay.example',ownerPubkey:owner,allowFrom:[owner],agents,cliPath:cli});
     const e=signEvent(ownerKey,{kind:9,tags:[['h',channel],['p',grok]],content:'Ask Claude what changed'});
     sockets[0].h.message({data:JSON.stringify(['EVENT','messages',e])});
@@ -224,10 +224,11 @@ test('a turn that fails after its message still wakes the named agents in the ch
       }};sessions.set(sessionId,agent);return {agent};
   }};
   const original=globalThis.WebSocket;
-  globalThis.WebSocket=class{constructor(){this.h={};sockets.push(this);}addEventListener(t,f){this.h[t]=f;}send(){}close(){}};
+  // Posts leave as signed events on the relay socket (durable outbox), so the fake relay records and accepts them.
+  globalThis.WebSocket=class{constructor(){this.h={};sockets.push(this);queueMicrotask(()=>this.h.open?.());}addEventListener(t,f){this.h[t]=f;}send(raw){const m=JSON.parse(raw);if(m[0]==='EVENT'){posts.push({text:m[1].content,tags:m[1].tags});queueMicrotask(()=>this.h.message?.({data:JSON.stringify(['OK',m[1].id,true,''])}));}}close(){}};
   try{
     await apply({tools:{register:t=>registered.push(t)},get:n=>n==='agents'?service:undefined,
-      logger:()=>({info(){},warn(){}}),on:(name,fn)=>{if(name==='dispose')dispose=fn;return ()=>{};}},
+      effect:fn=>{dispose=fn();},logger:()=>({info(){},warn(){}}),on:(name,fn)=>{if(name==='dispose')dispose=fn;return ()=>{};}},
       {keyFile:agents[0].keyFile,relayUrl:'https://relay.example',ownerPubkey:owner,allowFrom:[owner],agents,cliPath:cli});
     const e=signEvent(ownerKey,{kind:9,tags:[['h',channel],['p',grok]],content:'Ask Claude what changed, here'});
     sockets[0].h.message({data:JSON.stringify(['EVENT','messages',e])});
@@ -235,9 +236,10 @@ test('a turn that fails after its message still wakes the named agents in the ch
     assert.deepEqual(posts.map(p=>p.text),['What changed?','Buzz changed.','Done.']);
     // The request was asked in the channel the human wrote in, addressed to Claude: no private DM.
     assert.equal(dms.length,0);
-    assert.ok(posts[0].args.includes('--channel')&&posts[0].args.includes(channel));
-    assert.equal(posts[0].args[posts[0].args.indexOf('--mention')+1],claude);
-    assert.equal(posts[1].args[posts[1].args.indexOf('--channel')+1],channel);
+    const tag=(p,k)=>p.tags.filter(t=>t[0]===k).map(t=>t[1]);
+    assert.deepEqual(tag(posts[0],'h'),[channel]);
+    assert.ok(tag(posts[0],'p').includes(claude));
+    assert.deepEqual(tag(posts[1],'h'),[channel]);
   }finally{dispose?.();await new Promise(r=>setTimeout(r,20));globalThis.WebSocket=original;rmSync(dir,{recursive:true,force:true});}
 });
 

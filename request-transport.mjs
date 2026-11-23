@@ -1,4 +1,6 @@
-import { withIdentity, buzzJson, ensureOwner } from './buzz-mcp.mjs';
+import { signEvent } from './listen.mjs';
+import { publishSigned } from './delivery.mjs';
+import { withIdentity, buzzJson, ensureOwner, readKey } from './buzz-mcp.mjs';
 const HEX = /^[0-9a-f]{64}$/, UUID = /^[0-9a-f-]{36}$/;
 export function requestTransport(identities) {
   const as = (actor, fn) => {
@@ -7,6 +9,19 @@ export function requestTransport(identities) {
     return withIdentity(identity, fn);
   };
   return {
+    prepare(actor, channel, text, replyTo, mention) {
+      const identity = identities.get(actor);
+      if (!identity) throw new Error('No configured runtime identity');
+      const tags = [['h', channel]];
+      if (replyTo) tags.push(['e', replyTo, '', 'reply']);
+      if (mention) tags.push(['p', mention]);
+      return signEvent(readKey(identity.BUZZ_KEY_FILE), {kind: 9, tags, content: text});
+    },
+    publish(actor, event) {
+      const identity = identities.get(actor);
+      if (!identity) throw new Error('No configured runtime identity');
+      return publishSigned({relayUrl: identity.BUZZ_RELAY_URL, secretHex: readKey(identity.BUZZ_KEY_FILE), event, signEvent});
+    },
     agents: () => [...identities].map(([pubkey, i]) => ({ name: i.name, pubkey })),
     resolve(ref) {
       const key = String(ref || '').replace(/^@/, '').toLowerCase();
