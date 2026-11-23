@@ -190,7 +190,10 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
     const status = (text) => post(text).catch(err =>
       log({ event: "buzz_status_error", agent: name, error: String(err?.message || err).slice(0, 200) }));
     // Receipt is outside the thread queue: even a queued request is acknowledged now.
-    const receipt = r.fromAgent ? Promise.resolve() : status(previous
+    // Persist before attempting the send: retries (including after restart) must not spam receipts.
+    const needsReceipt = !r.fromAgent && !existing?.receiptAttempted;
+    if (needsReceipt) update(e.id, {receiptAttempted: true});
+    const receipt = !needsReceipt ? Promise.resolve() : status(previous
       ? `(${name} received your message. It is queued behind an earlier request in this thread.)`
       : `(${name} received your message and is starting work.)`);
     let timer, deadlineTimer;
@@ -318,7 +321,7 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
       try { socket.close(); } catch { /* already disconnected */ }
       log({ event: "buzz_reconnect", agent: name, in_ms: delay });
       reconnectTimer = setTimeout(open, delay); delay = Math.min(delay * 2, 60_000);
-      reconnectTimer.unref?.();
+      // Keep a pending reconnect alive even after the old socket has fully closed.
     };
     const disconnect = reconnect;
     heartbeatDeadline = setTimeout(disconnect, heartbeatIntervalMs + heartbeatTimeoutMs);
