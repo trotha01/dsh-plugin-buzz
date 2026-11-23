@@ -1,0 +1,15 @@
+{
+  "backup": "/home/trevor/dsh-workspace/agent-workspaces/codex/buzz-delivery-backup-20261117T051440Z",
+  "installed": "/home/trevor/dsh-home/profiles/web/node_modules/dsh-plugin-buzz",
+  "commit": "f93c6b0f5e31f62bb38d74888738a0fa6ab976fb",
+  "restarted": false,
+  "files": {
+    "index.js": "a338d3025ba8b3e760103b2d460ceefccb802f3f5d7a2c07302526e3bdacc625",
+    "listen.mjs": "dfa9a8f67d45c80fa5ea8f4f27821cfdca88ee97d019889b7e6e1f20fed1f3e7",
+    "agent-turn.mjs": "15ad8ecd6af7f30e33ff07994015fcadbfd27dcd0d2bc2eb99ab933dd4409665",
+    "requests.mjs": "b17fd4273386653730d6c148c3d4d9a2c2a2e3733ff6c01895fa1341480214f3",
+    "request-transport.mjs": "ab78a4a192f754b50ae42b1667500f224a10e4159c9bd4f8ba6c31cb9d989de4",
+    "package.json": "7f8f7b99e4247b274857dcae9847ee36464b44b4eb5f9eb2b024beacc0a56068",
+    "delivery.mjs": "f377d36b859262ea8ba55639d7191f5c94650b99266685da77754097f937d4e1"
+  }
+}

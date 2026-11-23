@@ -7,8 +7,8 @@ import { createHash } from "node:crypto";
 export const sessionIdFor = (agentName, threadKey) =>
   `session-buzz-${createHash("sha256").update(`${agentName}\0${threadKey}`).digest("hex").slice(0, 32)}`;
 
-/** Last non-empty assistant text after `firstSeq` (same rule as dsh-headless). */
-export function finalText(session, firstSeq) {
+/** Last non-empty assistant text after `firstSeq`, with the turn outcome (same rule as dsh-headless). */
+export function assistantText(session, firstSeq) {
   let text = "";
   let reason;
   for (let seq = firstSeq; seq < session.seq; seq++) {
@@ -20,11 +20,22 @@ export function finalText(session, firstSeq) {
       if (t) text = t;
     }
   }
+  return { text, reason };
+}
+
+/** A failed turn, carrying the text the model did produce for callers that can still act on it. */
+const turnFailure = (message, text) => Object.assign(new Error(message), { finalText: text });
+
+/** Last non-empty assistant text after `firstSeq`; throws when the turn did not end successfully. */
+export function finalText(session, firstSeq) {
+  const { text, reason } = assistantText(session, firstSeq);
   // Provider failures are durable turn outcomes, not necessarily rejected whenIdle() promises.
   // Do not mistake an earlier "working on it" message for a successful final answer, or expose
-  // raw provider error bodies (which may include request details) to the chat.
-  if (reason?.kind === "error") throw new Error("The model turn failed. Check the Harness conversation for details, then retry.");
-  if (reason?.kind === "interrupted" || reason?.kind === "aborted") throw new Error("The model turn was interrupted. Please resend your request.");
+  // raw provider error bodies (which may include request details) to the chat. The text travels
+  // on the error so a caller that can tell the difference (the request controller, which reads
+  // explicit Buzz actions out of it) is not left with nothing when a finished message is rejected.
+  if (reason?.kind === "error") throw turnFailure("The model turn failed. Check the Harness conversation for details, then retry.", text);
+  if (reason?.kind === "interrupted" || reason?.kind === "aborted") throw turnFailure("The model turn was interrupted. Please resend your request.", text);
   return text;
 }
 
@@ -66,21 +77,22 @@ export async function userContent(ctx, { provider, model }, body, images = [], f
  * installModelSelection, brandString, SessionSeq, and optionally images(event) -> { images, failed } for Buzz
  * attachments), injected so tests run without dsh.
  */
-export function makeAnswerer(ctx, { name, provider, model, instructions = "", cwd }, deps) {
+export function makeAnswerer(ctx, { name, provider, model, instructions = "", cwd, sessionBindings = [] }, deps) {
   const selection = { provider, model };
   const setup = (agentCtx, agent) => {
     if (agent.model.current()?.model !== model || agent.model.current()?.provider !== provider) agent.model.select({ ...selection });
     deps.installModelSelection(agentCtx);
   };
   const queues = new Map();
-  const answer = async (text, { threadKey, onProgress, event, requestContext, runtimePrompt, beforeTurn, sessionTopic }) => {
+  const destination = options => options.sessionId || sessionBindings.find(b => b.threadKey === options.threadKey)?.sessionId || sessionIdFor(name, options.threadKey);
+  const answer = async (text, { threadKey, sessionId: requestedSessionId, onProgress, event, requestContext, runtimePrompt, beforeTurn, sessionTopic }) => {
     const agents = ctx.get("agents");
     if (!agents) throw new Error("dsh agents service is not available");
-    const sessionId = deps.brandString(sessionIdFor(name, threadKey));
+    const sessionId = deps.brandString(destination({threadKey, sessionId: requestedSessionId}));
     let agent = agents.get(sessionId);
     if (!agent) {
       try { ({ agent } = await agents.resume({ resumeSessionId: sessionId, agentOptions: { ...selection }, setup })); }
-      catch { ({ agent } = await agents.create({ sessionId, meta: { cwd }, agentOptions: { ...selection }, setup })); }
+      catch (err) { if (sessionId !== sessionIdFor(name, threadKey)) throw new Error('Bound session could not be resumed'); ({ agent } = await agents.create({ sessionId, meta: { cwd }, agentOptions: { ...selection }, setup })); }
     }
     await agent.whenIdle();
     await beforeTurn?.();
@@ -125,7 +137,8 @@ export function makeAnswerer(ctx, { name, provider, model, instructions = "", cw
       for (;;) {
         await agent.whenIdle();
         await progressDelivery;
-        if (failure) throw new Error("The model turn failed. Check the Harness conversation for details, then retry.");
+        if (failure) throw turnFailure("The model turn failed. Check the Harness conversation for details, then retry.",
+          assistantText({ seq: agent.session.seq, eventAt: (s) => agent.session.eventAt(deps.SessionSeq(s)) }, firstSeq).text);
         const idleSeq = agent.session.seq;
         // Publish idle-turn text before waiting for delegated work.
         const progress = finalText({ seq: idleSeq, eventAt: (s) => agent.session.eventAt(deps.SessionSeq(s)) }, firstSeq);
@@ -141,7 +154,7 @@ export function makeAnswerer(ctx, { name, provider, model, instructions = "", cw
     }
   };
   return (text, options) => {
-    const key = options.threadKey;
+    const key = destination(options);
     const pending = (queues.get(key) || Promise.resolve()).catch(() => {}).then(() => answer(text, options));
     queues.set(key, pending);
     void pending.finally(() => { if (queues.get(key) === pending) queues.delete(key); }).catch(() => {});

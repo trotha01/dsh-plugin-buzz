@@ -1,4 +1,6 @@
-import { withIdentity, buzzJson, ensureOwner } from './buzz-mcp.mjs';
+import { signEvent } from './listen.mjs';
+import { publishSigned } from './delivery.mjs';
+import { withIdentity, buzzJson, ensureOwner, readKey } from './buzz-mcp.mjs';
 const HEX = /^[0-9a-f]{64}$/, UUID = /^[0-9a-f-]{36}$/;
 export function requestTransport(identities) {
   const as = (actor, fn) => {
@@ -7,6 +9,19 @@ export function requestTransport(identities) {
     return withIdentity(identity, fn);
   };
   return {
+    prepare(actor, channel, text, replyTo, mention) {
+      const identity = identities.get(actor);
+      if (!identity) throw new Error('No configured runtime identity');
+      const tags = [['h', channel]];
+      if (replyTo) tags.push(['e', replyTo, '', 'reply']);
+      if (mention) tags.push(['p', mention]);
+      return signEvent(readKey(identity.BUZZ_KEY_FILE), {kind: 9, tags, content: text});
+    },
+    publish(actor, event) {
+      const identity = identities.get(actor);
+      if (!identity) throw new Error('No configured runtime identity');
+      return publishSigned({relayUrl: identity.BUZZ_RELAY_URL, secretHex: readKey(identity.BUZZ_KEY_FILE), event, signEvent});
+    },
     agents: () => [...identities].map(([pubkey, i]) => ({ name: i.name, pubkey })),
     resolve(ref) {
       const key = String(ref || '').replace(/^@/, '').toLowerCase();
@@ -40,9 +55,9 @@ export function requestTransport(identities) {
 export function requestTools(controller) {
   const string = { type: 'string' };
   return [
-    { name: 'buzz_ask', description: 'Request work or clarification from another configured agent. Opens a DM including your owner. Returns immediately; result arrives in a later turn. Mentions alone do not schedule agents.',
-      inputSchema: { type: 'object', properties: { agent: string, message: string }, required: ['agent', 'message'], additionalProperties: false },
-      run: (args, ctx) => controller.ask(ctx, args.agent, args.message) },
+    { name: 'buzz_ask', description: 'Request work or clarification from another configured agent. Without channel it opens a DM including your owner; channel="here" (or a channel id you and that agent are both in) asks in that conversation, where every member reads the question and the answer. Returns immediately; the result arrives in a later turn. Mentions and channel membership alone do not schedule agents.',
+      inputSchema: { type: 'object', properties: { agent: string, message: string, channel: { type: 'string', description: '"here" for the conversation this turn came from, or a Buzz channel id' } }, required: ['agent', 'message'], additionalProperties: false },
+      run: (args, ctx) => controller.ask(ctx, args.agent, args.message, { channel: args.channel }) },
     { name: 'buzz_respond', description: 'Answer or block the current request exactly once. An answer does not request another answer.',
       inputSchema: { type: 'object', properties: { request_id: string, outcome: { enum: ['answer', 'blocked'] }, message: string }, required: ['request_id', 'outcome', 'message'], additionalProperties: false },
       run: (args, ctx) => controller.respond(ctx, args.request_id, args.outcome, args.message) },

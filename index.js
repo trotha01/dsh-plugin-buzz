@@ -3,13 +3,16 @@
 // (2) optionally puts dsh models in Buzz as their own users: each entry of `agents` keeps a live connection to the
 // relay and answers your messages to it right away (push, no polling) with a fixed dsh provider/model.
 // Plain ESM, no build step. Settings come from the row's config, else from the environment dsh runs in.
+import { createHash } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { readFileSync, writeFileSync, renameSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import Schema from '@deepseek-ai/schemastery'
 import * as mcpClient from '@deepseek-ai/dsh-mcp-client'
 import { readKey, pubkeyOf, cliPath, cliEnv, validateRelay, ensureOwner, TOOLS, withIdentity } from './buzz-mcp.mjs'
-import { listen } from './listen.mjs'
+import { DeliveryLedger, publishSigned } from './delivery.mjs'
+import { sessionIdFor } from './agent-turn.mjs'
+import { signEvent, listen } from './listen.mjs'
 import { makeAnswerer } from './agent-turn.mjs'
 import { eventImages } from './media.mjs'
 import { RequestController, requestPrompt } from './requests.mjs'
@@ -27,7 +30,8 @@ export const Config = Schema.object({
   serverName: Schema.string().default('buzz').description('Tool namespace: tools appear as mcp__<serverName>__buzz_send'),
   ownerPubkey: Schema.string().default('').description('Human owner public key. Added to every conversation before agent messages are sent; sends fail closed if membership cannot be confirmed. Default: $BUZZ_OWNER_PUBKEY'),
   allowFrom: Schema.array(Schema.string()).default([]).description('Buzz public keys (64-character hex) whose messages the agents below answer. Empty: they answer nobody'),
-  allowAgents: Schema.array(Schema.string()).default([]).description('Other agent public keys recognized for owner-visible DMs. Automatic mention replies apply only in legacy mode'),
+  allowAgents: Schema.array(Schema.string()).default([]).description('Trusted agent public keys for owner-visible DMs and optional channel mention replies'),
+  channelAgentMentions: Schema.boolean().default(false).description('Answer explicit channel mentions from allowAgents while keeping durable requests enabled'),
   explicitRequests: Schema.boolean().default(true).description('Use explicit, durable agent requests instead of automatic agent replies'),
   requestStore: Schema.string().default('').description('SQLite request ledger path; defaults beside the first agent key'),
   maxAgentReplies: Schema.natural().default(10).description('Shared request budget per originating human event (maximum 10); legacy mode uses per-thread reply caps'),
@@ -38,6 +42,7 @@ export const Config = Schema.object({
     provider: Schema.string().required().description('dsh provider id, as in the model picker settings'),
     model: Schema.string().required().description('dsh model id of that provider'),
     cwd: Schema.string().default('').description('Working directory for new conversations with this identity. Overrides the shared cwd; use a separate directory per agent'),
+    sessionBindings: Schema.array(Schema.object({ threadKey: Schema.string().required(), sessionId: Schema.string().required() })).default([]).description('Owner-configured Buzz thread to existing Harness session bindings'),
     instructions: Schema.string().default('').description('Text put before every message to this identity, e.g. "Pass the message to subagent_codex unchanged and reply with its answer."'),
   })).default([]).description('dsh models that live in Buzz as their own users. Mention one, DM it, or reply in its thread: it answers at once'),
 })
@@ -72,8 +77,8 @@ export function resolve(config = {}, env = process.env) {
 export function threadStore(keyFile) {
   const file = `${keyFile}.threads.json`
   return {
-    load() { try { return JSON.parse(readFileSync(file, 'utf8')) } catch { return {} } },
-    save(obj) { try { writeFileSync(`${file}.tmp`, JSON.stringify(obj), { mode: 0o600 }); renameSync(`${file}.tmp`, file) } catch { /* memory only */ } },
+    load() { try { return JSON.parse(readFileSync(file, 'utf8')) } catch (err) { if (err.code === 'ENOENT') return {}; throw err } },
+    save(obj) { writeFileSync(`${file}.tmp`, JSON.stringify(obj), { mode: 0o600 }); renameSync(`${file}.tmp`, file) },
   }
 }
 
@@ -154,10 +159,19 @@ export async function apply(ctx, config = {}) {
   const allowFrom = (config.allowFrom || []).map((s) => s.trim().toLowerCase()).filter((s) => HEX64.test(s))
   if (!allowFrom.length) warn('Buzz agents answer no humans until allowFrom lists at least one public key')
   if (allowFrom.length !== (config.allowFrom || []).length) warn('Invalid allowFrom entries ignored: use 64-character hex public keys, not names or npub strings')
+  const live = []
+  let controller, disposed = false
+  // Cordis owns effects; there is no lifecycle event named "dispose".
+  // Register before asynchronous setup so failed or interrupted setup also cleans up.
+  ctx.effect(() => () => {
+    disposed = true
+    for (const c of live) { c.close(); if (LISTENERS.get(c.me) === c) LISTENERS.delete(c.me) }
+    return Promise.allSettled([controller?.close(), ...live.map(async c => { await c.drain?.(); c.ledger?.close() })])
+  }, 'buzz.listeners')
   const deps = await dshDeps()
+  if (disposed) return
   const cli = config.cliPath || process.env.BUZZ_CLI || ''
   const cwd = config.cwd || process.cwd()
-  const live = []
   const keys = new Map()
   const usedNames = new Set(), usedKeys = new Set()
   for (const a of agents) {
@@ -179,12 +193,11 @@ export async function apply(ctx, config = {}) {
     BUZZ_RELAY_URL: relayUrl, BUZZ_CLI: cli, BUZZ_OWNER_PUBKEY: ownerPubkey, agentPubkeys: allowAgents,
   }]))
   const answerers = new Map()
-  let controller
   for (const [a, key] of keys) {
     const actor = pubkeyOf(key)
     answerers.set(actor, makeAnswerer(ctx, { ...a, cwd: a.cwd || cwd }, { ...deps,
       bindIdentity: (agent, event, requestContext) => identities.set(agent, {
-        ...configured.get(actor), requestContext, requestController: controller, replyOnly: !explicitRequests && allowAgents.includes(event?.pubkey),
+        ...configured.get(actor), requestContext, requestController: controller, replyOnly: allowAgents.includes(event?.pubkey),
       }), images: event => eventImages(event, { secretHex: key, relayUrl }),
     }))
   }
@@ -194,7 +207,7 @@ export async function apply(ctx, config = {}) {
       transport: requestTransport(configured), limit: maxAgentReplies, log: warn,
       run: (binding, { kind, snapshot }) => answerers.get(binding.actor)('', {
         threadKey: binding.threadKey || `request:${binding.exchange}:${binding.requestId || 'caller'}`,
-        requestContext: binding, runtimePrompt: requestPrompt(kind, snapshot),
+        sessionId: binding.sessionId, requestContext: binding, runtimePrompt: requestPrompt(kind, snapshot),
         sessionTopic: snapshot.request?.message,
         beforeTurn: async () => { controller.assertActive(binding); await controller.inspect(binding, snapshot.request?.id); },
       }),
@@ -211,22 +224,43 @@ export async function apply(ctx, config = {}) {
     })
     controller.kick()
   } else if (explicitRequests) warn('Agent requests require a configured human owner; automatic agent replies are disabled')
+  const deliveryLedgers = new Map()
   for (const a of agents) {
     const secretHex = keys.get(a)
     if (!secretHex) continue
     const actor = pubkeyOf(secretHex)
+    const old = LISTENERS.get(actor)
+    if (old) { old.close(); await old.drain?.(); old.ledger?.close(); LISTENERS.delete(actor) }
+    if (disposed) break
+    const ledger = new DeliveryLedger(`${a.keyFile}.${createHash('sha256').update(relayUrl).digest('hex').slice(0, 24)}.delivery.sqlite`)
+    deliveryLedgers.set(actor, ledger)
+    const resolveSession = threadKey => (a.sessionBindings || []).find(b => b.threadKey === threadKey)?.sessionId || sessionIdFor(a.name, threadKey)
     const conn = listen({
-      name: a.name, relayUrl, secretHex, allowFrom, allowAgents, maxAgentReplies, ownerPubkey, explicitRequests,
+      ledger, resolveSession,
+      sendSigned: event => publishSigned({relayUrl, secretHex, event, signEvent}),
+      name: a.name, relayUrl, secretHex, allowFrom, allowAgents, maxAgentReplies, ownerPubkey, explicitRequests, channelAgentMentions: config.channelAgentMentions === true,
       beforeAnswer: makeVisibilityGuard({ relayUrl, keyFile: a.keyFile, cli, ownerPubkey }),
       answer: async (text, options) => {
-        if (!controller) return answerers.get(actor)(text, options)
-        const binding = controller.start({ actor, owner: ownerPubkey, origin: options.event.id, threadKey: options.threadKey,
+        if (!controller || allowAgents.includes(options.event?.pubkey)) return answerers.get(actor)(text, options)
+        const binding = controller.start({ actor, owner: ownerPubkey, origin: options.event.id, threadKey: options.threadKey, sessionId: options.sessionId,
           channel: options.event.tags.find(t => t[0] === 'h')[1], replyTo: options.event.id, human: options.event.pubkey === ownerPubkey })
         const snapshot = await controller.inspect(binding)
-        const result = await answerers.get(actor)(text, { ...options, onProgress: undefined,
-          requestContext: binding, runtimePrompt: requestPrompt('human', snapshot) + '\n\nHuman message:\n' })
+        let result, failure
+        try {
+          result = await answerers.get(actor)(text, { ...options, onProgress: undefined,
+            requestContext: binding, runtimePrompt: requestPrompt('human', snapshot) + '\n\nHuman message:\n' })
+        } catch (err) {
+          // A turn can fail after the model has already finished its message (a provider reporting
+          // context overflow on a completed answer, for one). Throwing here would also throw away the
+          // agent requests in that message, so the finished text is still carried out and delivered
+          // with the failure named, instead of only "(could not answer)".
+          if (typeof err?.finalText !== 'string' || !err.finalText.trim()) throw err
+          result = err.finalText
+          failure = String(err?.message || err)
+        }
         const output = await controller.finish(binding, result)
-        return output?.text || ''
+        return [output?.text, failure && `(${a.name}: the model turn reported a failure after this message: ${failure})`]
+          .filter(t => t && t.trim()).join('\n\n')
       },
       send: makeSender({ relayUrl, keyFile: a.keyFile, cli, ownerPubkey }),
       store: threadStore(a.keyFile),
@@ -234,10 +268,23 @@ export async function apply(ctx, config = {}) {
     })
     // A config reload can apply this plugin again without disposing the old instance; one listener per identity per
     // process, or every message is answered twice.
-    LISTENERS.get(conn.me)?.close()
+    conn.ledger = ledger
     LISTENERS.set(conn.me, conn)
     say(`Buzz agent ${a.name} (${a.provider}/${a.model}) listening as ${conn.me}`)
     live.push(conn)
   }
-  ctx.on?.('dispose', () => { void controller?.close(); for (const c of live) { c.close(); if (LISTENERS.get(c.me) === c) LISTENERS.delete(c.me) } })
+  ctx.tools.register({
+    name: `mcp__${config.serverName || 'buzz'}__buzz_delivery_status`,
+    description: 'Inspect delivery state, suppression reason and destination session for a Buzz message received by your identity.',
+    parameters: {type: 'object', properties: {message_id: {type: 'string'}}, required: ['message_id'], additionalProperties: false},
+    output: {schema: {type: 'string'}, render: (_args, value) => [{type: 'text', text: value}]},
+    execute: ({message_id}, exec) => {
+      const identity = identities.get(exec.agent)
+      if (!identity) throw new Error('No bound Buzz identity')
+      const actor = pubkeyOf(readKey(identity.BUZZ_KEY_FILE))
+      const row = deliveryLedgers.get(actor)?.get(message_id)
+      if (!row) return JSON.stringify({state: 'not_received'})
+      return JSON.stringify({id: row.id, state: row.state, reason: row.reason, sessionId: row.sessionId, threadKey: row.route?.threadKey, updatedAt: row.updatedAt})
+    },
+  })
 }

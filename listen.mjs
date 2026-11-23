@@ -60,7 +60,7 @@ export function route(e, { me, allowFrom, allowAgents = new Set(), dmChannels, t
  * One identity's live connection. `answer(text, ctx)` returns the reply text; `send(reply)` posts it.
  * Reconnects with backoff and resubscribes from the last event seen, so a dropped socket loses nothing.
  */
-export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [], maxAgentReplies = 10, ownerPubkey, beforeAnswer = async () => {}, explicitRequests = false, answer, send, log, store, WebSocketImpl = globalThis.WebSocket, now = () => Date.now(), statusIntervalMs = 60_000 }) {
+export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [], maxAgentReplies = 10, ownerPubkey, beforeAnswer = async () => {}, explicitRequests = false, channelAgentMentions = false, answer, send, log, store, WebSocketImpl = globalThis.WebSocket, now = () => Date.now(), statusIntervalMs = 60_000, ledger, sendSigned, resolveSession, retryIntervalMs = 30_000, turnTimeoutMs = 30 * 60_000, queueTimeoutMs = 30 * 60_000 }) {
   const me = bytesToHex(schnorr.getPublicKey(hexToBytes(secretHex)));
   const url = wsUrl(relayUrl);
   const allow = new Set(allowFrom);
@@ -83,30 +83,84 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
   const seen = new Set();
   const statusTimers = new Set();
   const queues = new Map();           // thread key -> promise chain: one turn at a time per thread
-  let since = Math.floor(now() / 1000);
+  let since = ledger?.cursor(Math.floor(now() / 1000)) ?? Math.floor(now() / 1000);
+  const publishing = new Set();
+  const publications = new Set();
+  const update = (id, patch) => {
+    const row = ledger?.put(id, patch);
+    if (ledger) log({event: 'buzz_delivery', agent: name, message: id, state: patch.state, reason: patch.reason});
+    return row;
+  };
+  const publish = row => {
+    const task = publishRow(row);
+    publications.add(task);
+    void task.finally(() => publications.delete(task)).catch(() => {});
+    return task;
+  };
+  const publishRow = async (row) => {
+    if (closed || publishing.has(row.id) || !row.outbox) return;
+    publishing.add(row.id);
+    try {
+      await beforeAnswer(row.route.channel);
+      const id = await sendSigned(row.outbox);
+      remember(id, row.route.threadKey);
+      update(row.id, {state: 'published', reason: null});
+    } catch (err) {
+      update(row.id, {state: 'answered', reason: 'publication_retry', error: String(err?.message || err).slice(0, 200)});
+    } finally { publishing.delete(row.id); }
+  };
+  const recover = () => {
+    if (closed || !ledger) return;
+    for (const row of ledger.list()) {
+      if (row.state === 'answered' && row.outbox && sendSigned) void publish(row);
+      else if (['received', 'queued', 'waiting_metadata'].includes(row.state) && !seen.has(row.id)) handle(row.event);
+    }
+  };
+  const retryTimer = ledger && setInterval(recover, retryIntervalMs);
+  retryTimer?.unref?.();
   let ws, closed = false, delay = 1000, authed = false;
   let connectionSince = since;
   const subscribeChannel = (channel) => ws.send(JSON.stringify(["REQ", `channel:${channel}`,
-    { kinds: [9], "#h": [channel], since: connectionSince }]));
+    { kinds: [9], "#h": [channel], since: Math.max(0, connectionSince - (ledger ? 60 : 0)) }]));
 
   const subscribe = () => {
     ws.send(JSON.stringify(["REQ", "groups", { kinds: [39000, 39002], "#p": [me] }, { kinds: [39000, 39002], "#d": [...members] }]));
-    ws.send(JSON.stringify(["REQ", "mentions", { kinds: [9], "#p": [me], since }]));
+    ws.send(JSON.stringify(["REQ", "mentions", { kinds: [9], "#p": [me], since: Math.max(0, since - (ledger ? 60 : 0)) }]));
     for (const channel of members) subscribeChannel(channel);
-    ws.send(JSON.stringify(["REQ", "membership", { kinds: [44100], "#p": [me], since }]));
+    ws.send(JSON.stringify(["REQ", "membership", { kinds: [44100], "#p": [me], since: Math.max(0, since - (ledger ? 60 : 0)) }]));
   };
   const handle = (e) => {
+    if (e.kind !== 9 || e.pubkey === me || (!allow.has(e.pubkey) && !agentsAllowed.has(e.pubkey))) return;
+    const existing = ledger?.get(e.id);
+    if (existing && !['received', 'queued', 'waiting_metadata'].includes(existing.state)) {
+      if (existing.state === 'answered' && sendSigned) void publish(existing);
+      return;
+    }
     if (seen.has(e.id)) return;
-    seen.add(e.id); if (seen.size > 5000) seen.delete(seen.values().next().value);
-    if (e.created_at > since) since = e.created_at;
-    const r = route(e, { me, allowFrom: allow, allowAgents: agentsAllowed, dmChannels, threads });
-    if (!r || (explicitRequests && r.fromAgent)) return;
-    if (r.fromAgent) {
+    if (ledger && !existing) update(e.id, {state: 'received', event: e});
+    // Keep the installation replay floor: receipt of one channel cannot prove other channels caught up.
+    if (!ledger && e.created_at > since) since = e.created_at;
+    const r = existing?.route ?? route(e, { me, allowFrom: allow, allowAgents: agentsAllowed, dmChannels, threads });
+    if (!r) {
+      if (ledger) update(e.id, {state: members.has(tagValues(e, 'h')[0]) ? 'suppressed' : 'waiting_metadata', reason: 'not_addressed_or_membership_unknown'});
+      return;
+    }
+    if (explicitRequests && r.fromAgent && !(channelAgentMentions &&
+        !dmChannels.has(r.channel) && tagValues(e, "p").includes(me))) {
+      update(e.id, {state: 'suppressed', reason: 'explicit_request_required', route: r}); return;
+    }
+    if (r.fromAgent && existing?.state !== 'queued') {
       const n = agentReplies.get(r.threadKey) ?? 0;
-      if (n >= limit) return void log({ event: "buzz_agent_cap", agent: name, thread: r.threadKey.slice(0, 12), replies: n });
+      if (n >= limit) {
+        update(e.id, {state: 'suppressed', reason: 'reply_budget_exhausted', route: r});
+        return void log({event: 'buzz_agent_cap', agent: name, thread: r.threadKey.slice(0, 12), replies: n});
+      }
       agentReplies.set(r.threadKey, n + 1);
       persist();
     }
+    const sessionId = existing?.sessionId ?? resolveSession?.(r.threadKey);
+    update(e.id, {state: 'queued', route: r, sessionId, queuedAt: existing?.queuedAt ?? now()});
+    seen.add(e.id); if (seen.size > 5000) seen.delete(seen.values().next().value);
     remember(e.id, r.threadKey); remember(r.replyTo, r.threadKey);
     const previous = queues.get(r.threadKey);
     const receivedAt = now();
@@ -117,7 +171,7 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
       const pending = delivery.then(async () => {
         if (closed || !text || (modelText && text === lastModelText)) return;
         const id = await send({ channel: r.channel, replyTo: r.replyTo,
-          mention: e.pubkey, text });
+          mention: explicitRequests && r.fromAgent ? undefined : e.pubkey, text });
         if (id) remember(id, r.threadKey);
         lastActivity = now();
         if (modelText) lastModelText = text;
@@ -131,7 +185,7 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
     const receipt = r.fromAgent ? Promise.resolve() : status(previous
       ? `(${name} received your message. It is queued behind an earlier request in this thread.)`
       : `(${name} received your message and is starting work.)`);
-    let timer;
+    let timer, deadlineTimer;
     if (!r.fromAgent) {
       timer = setInterval(() => {
         if (closed || finished || now() - lastActivity < statusIntervalMs) return;
@@ -148,20 +202,42 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
     const next = (previous ?? Promise.resolve()).then(async () => {
       await receipt;
       if (closed) return;
+      if (ledger && now() - ledger.get(e.id).queuedAt >= queueTimeoutMs) {
+        update(e.id, {state: 'failed', reason: 'queue_deadline_exceeded'}); return;
+      }
       await beforeAnswer(r.channel);
+      if (closed) return;
+      update(e.id, {state: 'started'});
       active = true;
+      deadlineTimer = ledger && setTimeout(() => {
+        update(e.id, {state: 'uncertain', reason: 'turn_deadline_exceeded_still_running'});
+      }, turnTimeoutMs);
+      deadlineTimer?.unref?.();
       const t0 = now();
       if (previous && !r.fromAgent) await status(`(${name} is now starting your queued request.)`);
       let text;
-      try { text = await answer(e.content, { threadKey: r.threadKey, event: e, onProgress: r.fromAgent ? async () => {} : text => post(text, true) }); }
-      catch (err) { text = `(${name} could not answer: ${String(err?.message || err).slice(0, 300)})`; }
+      try { text = await answer(e.content, { threadKey: r.threadKey, sessionId, event: e, onProgress: (r.fromAgent || ledger) ? async () => {} : text => post(text, true) }); }
+      catch (err) { update(e.id, {outcome: 'model_failed'}); text = `(${name} could not answer: ${String(err?.message || err).slice(0, 300)})`; }
       finished = true;
+      clearTimeout(deadlineTimer);
       clearInterval(timer);
-      if (closed) return;
-      if (text) await post(text, true);
+      if (ledger && sendSigned && text) {
+        const tags = [['h', r.channel], ['e', r.replyTo, '', 'reply']];
+        // No recipient mention: delivery notifications/final replies must not create automatic agent loops.
+        const outbox = signEvent(secretHex, {kind: 9, tags, content: text});
+        const row = update(e.id, {state: 'answered', outbox});
+        if (!closed) await publish(row);
+      } else {
+        if (closed) return;
+        if (text) await post(text, true);
+        update(e.id, {state: 'published'});
+      }
       log({ event: "buzz_turn", agent: name, thread: r.threadKey.slice(0, 12), ms: now() - t0, chars: (text || "").length });
-    }).catch((err) => log({ event: "buzz_turn_error", agent: name, error: String(err?.message || err).slice(0, 200) }))
-      .finally(() => { finished = true; clearInterval(timer); statusTimers.delete(timer); });
+    }).catch((err) => {
+      update(e.id, {state: active ? 'uncertain' : 'failed', reason: active ? 'turn_interrupted' : 'visibility_check_failed'});
+      log({ event: "buzz_turn_error", agent: name, error: String(err?.message || err).slice(0, 200) });
+    })
+      .finally(() => { finished = true; clearTimeout(deadlineTimer); clearInterval(timer); statusTimers.delete(timer); });
     queues.set(r.threadKey, next);
     void next.finally(() => { if (queues.get(r.threadKey) === next) queues.delete(r.threadKey); });
   };
@@ -171,7 +247,7 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
     if (m[0] === "AUTH" && typeof m[1] === "string") {
       ws.send(JSON.stringify(["AUTH", signEvent(secretHex, { kind: 22242, tags: [["relay", url], ["challenge", m[1]]] })]));
     } else if (m[0] === "OK" && m[3] !== undefined && !authed) {
-      if (m[2] === true) { authed = true; delay = 1000; subscribe(); log({ event: "buzz_connected", agent: name }); }
+      if (m[2] === true) { authed = true; delay = 1000; subscribe(); recover(); log({ event: "buzz_connected", agent: name }); }
       else log({ event: "buzz_auth_refused", agent: name, reason: String(m[3]).slice(0, 200) });
     } else if (m[0] === "EVENT" && m[2] && typeof m[2] === "object") {
       const e = m[2];
@@ -189,6 +265,7 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
           if (!members.has(d)) { members.add(d); if (authed) subscribeChannel(d); }
         }
         if (e.kind === 39000 && (e.tags || []).some((t) => t[0] === "hidden" || (t[0] === "t" && t[1] === "dm"))) dmChannels.add(d);
+        recover();
       } else if (e.kind === 44100) {
         const d = tagValues(e, "h")[0] ?? tagValues(e, "d")[0];
         // Ask for the new channel's member list first; its 39002 (handled above) marks a DM and only then subscribes to
@@ -218,5 +295,5 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
     ws.addEventListener("error", () => { try { ws.close(); } catch { /* close handler reconnects */ } });
   };
   open();
-  return { me, close() { closed = true; for (const timer of statusTimers) clearInterval(timer); statusTimers.clear(); try { ws?.close(); } catch { /* already closed */ } } };
+  return { me, drain: () => Promise.allSettled([...queues.values(), ...publications]), close() { closed = true; clearInterval(retryTimer); for (const timer of statusTimers) clearInterval(timer); statusTimers.clear(); try { ws?.close(); } catch { /* already closed */ } } };
 }
