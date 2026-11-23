@@ -552,3 +552,32 @@ test('explicit mode ignores agent mentions and close-outs while still answering 
   assert.equal(route(reply, restored).threadKey, `dm:${CH}`);
   assert.equal(route(second, restored).threadKey, second.id);
  });
+
+test('opted-in channel mentions answer trusted agents without mentioning back; DMs stay explicit', async () => {
+  let ws; const calls = [], posts = [], logs = [];
+  class FakeWS {
+    constructor() { ws = this; }
+    addEventListener(t, f) { if (t === 'message') this.event = e => f({data: JSON.stringify(['EVENT', 'messages', e])}); }
+    send() {} close() {}
+  }
+  const c = listen({name:'Grok', relayUrl:'https://relay.example', secretHex:AGENT,
+    allowFrom:[OWNER_PK], allowAgents:[OTHER_PK], explicitRequests:true, channelAgentMentions:true,
+    maxAgentReplies:1, WebSocketImpl:FakeWS, log:e=>logs.push(e),
+    answer:async text=>{calls.push(text);return 'Answer';}, send:async r=>posts.push(r)});
+  try {
+    const root = msg(OTHER, [['p',ME]], 'question');
+    ws.event(msg(OWNER, [], 'unaddressed human'));
+    ws.event(msg(OTHER, [], 'unaddressed agent'));
+    ws.event(signEvent('44'.repeat(32),{kind:9,tags:[['h',CH],['p',ME]],content:'untrusted'}));
+    ws.event(root); ws.event(root);
+    ws.event(msg(OTHER, [['p',ME],['e',root.id,'','root']], 'capped'));
+    await new Promise(r=>setImmediate(r));
+    assert.deepEqual(calls,['question']);
+    assert.equal(posts.length,1); assert.equal(posts[0].mention,undefined);
+    assert.ok(logs.some(e=>e.event==='buzz_agent_cap'));
+    ws.event(signEvent(OTHER,{kind:39002,tags:[['d',CH],['p',ME],['p',OTHER_PK]]}));
+    ws.event(msg(OTHER,[['p',ME]],'DM remains explicit'));
+    await new Promise(r=>setImmediate(r));
+    assert.deepEqual(calls,['question']);
+  } finally { c.close(); }
+});
