@@ -60,7 +60,7 @@ export function route(e, { me, allowFrom, allowAgents = new Set(), dmChannels, t
  * One identity's live connection. `answer(text, ctx)` returns the reply text; `send(reply)` posts it.
  * Reconnects with backoff and resubscribes from the last event seen, so a dropped socket loses nothing.
  */
-export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [], maxAgentReplies = 10, ownerPubkey, beforeAnswer = async () => {}, explicitRequests = false, channelAgentMentions = false, answer, send, log, store, WebSocketImpl = globalThis.WebSocket, now = () => Date.now(), statusIntervalMs = 60_000, ledger, sendSigned, resolveSession, retryIntervalMs = 30_000, turnTimeoutMs = 30 * 60_000, queueTimeoutMs = 30 * 60_000 }) {
+export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [], maxAgentReplies = 10, ownerPubkey, beforeAnswer = async () => {}, explicitRequests = false, channelAgentMentions = false, answer, send, log, store, WebSocketImpl = globalThis.WebSocket, now = () => Date.now(), statusIntervalMs = 60_000, ledger, sendSigned, resolveSession, retryIntervalMs = 30_000, turnTimeoutMs = 30 * 60_000, queueTimeoutMs = 30 * 60_000, heartbeatIntervalMs = 30_000, heartbeatTimeoutMs = 10_000 }) {
   const me = bytesToHex(schnorr.getPublicKey(hexToBytes(secretHex)));
   const url = wsUrl(relayUrl);
   const allow = new Set(allowFrom);
@@ -120,6 +120,8 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
   retryTimer?.unref?.();
   let ws, closed = false, delay = 1000, authed = false;
   let connectionSince = since;
+  let reconnectTimer, heartbeatTimer, heartbeatDeadline, probeId, reconnect;
+  let probeSequence = 0;
   const subscribeChannel = (channel) => ws.send(JSON.stringify(["REQ", `channel:${channel}`,
     { kinds: [9], "#h": [channel], since: Math.max(0, connectionSince - (ledger ? 60 : 0)) }]));
 
@@ -134,6 +136,12 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
     const existing = ledger?.get(e.id);
     if (existing && !['received', 'queued', 'waiting_metadata'].includes(existing.state)) {
       if (existing.state === 'answered' && sendSigned) void publish(existing);
+      return;
+    }
+    // Controller publications are already scheduled durably. The signed marker also survives
+    // relay echo before ACK, reconnect replay, and separate recipient processes.
+    if (agentsAllowed.has(e.pubkey) && e.tags.some(t => t[0] === 'buzz-request')) {
+      update(e.id, {state: 'suppressed', reason: 'durable_request_delivery', event: e});
       return;
     }
     if (seen.has(e.id)) return;
@@ -205,7 +213,17 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
       if (ledger && now() - ledger.get(e.id).queuedAt >= queueTimeoutMs) {
         update(e.id, {state: 'failed', reason: 'queue_deadline_exceeded'}); return;
       }
-      await beforeAnswer(r.channel);
+      try { await beforeAnswer(r.channel); }
+      catch (err) {
+        // No model work has begun: retain the original deadline and budget reservation.
+        if (ledger) {
+          update(e.id, {state: 'queued', reason: 'visibility_check_retry'});
+          seen.delete(e.id);
+          log({event: 'buzz_visibility_retry', agent: name, error: String(err?.message || err).slice(0, 200)});
+          return;
+        }
+        throw err;
+      }
       if (closed) return;
       update(e.id, {state: 'started'});
       active = true;
@@ -244,7 +262,11 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
   const onMessage = (raw) => {
     let m; try { m = JSON.parse(typeof raw === "string" ? raw : raw.toString()); } catch { return; }
     if (closed || !Array.isArray(m)) return;
-    if (m[0] === "AUTH" && typeof m[1] === "string") {
+    if (m[0] === 'EOSE' && probeId && m[1] === probeId) {
+      clearTimeout(heartbeatDeadline);
+      ws.send(JSON.stringify(['CLOSE', probeId]));
+      probeId = undefined;
+    } else if (m[0] === "AUTH" && typeof m[1] === "string") {
       ws.send(JSON.stringify(["AUTH", signEvent(secretHex, { kind: 22242, tags: [["relay", url], ["challenge", m[1]]] })]));
     } else if (m[0] === "OK" && m[3] !== undefined && !authed) {
       if (m[2] === true) { authed = true; delay = 1000; subscribe(); recover(); log({ event: "buzz_connected", agent: name }); }
@@ -278,22 +300,45 @@ export function listen({ name, relayUrl, secretHex, allowFrom, allowAgents = [],
       // CLOSED ends this subscription, not the socket. Leaving the connection open
       // would look healthy while permanently missing that channel's messages.
       // Reconnect through the existing backoff path and replay from the cursor.
-      try { ws.close(); } catch { /* close may already be in progress */ }
+      reconnect();
     }
   };
   const open = () => {
     if (closed) return;
     authed = false;
     connectionSince = since;
-    ws = new WebSocketImpl(url);
-    ws.addEventListener("message", (ev) => onMessage(ev.data));
-    ws.addEventListener("close", () => {
-      if (closed) return;
+    const socket = ws = new WebSocketImpl(url);
+    let disconnected = false;
+    reconnect = () => {
+      if (closed || disconnected || socket !== ws) return;
+      disconnected = true;
+      clearInterval(heartbeatTimer); clearTimeout(heartbeatDeadline);
+      probeId = undefined;
+      // Do not wait for a close event: a half-open TCP connection may never emit one.
+      try { socket.close(); } catch { /* already disconnected */ }
       log({ event: "buzz_reconnect", agent: name, in_ms: delay });
-      setTimeout(open, delay); delay = Math.min(delay * 2, 60_000);
-    });
-    ws.addEventListener("error", () => { try { ws.close(); } catch { /* close handler reconnects */ } });
+      reconnectTimer = setTimeout(open, delay); delay = Math.min(delay * 2, 60_000);
+      reconnectTimer.unref?.();
+    };
+    const disconnect = reconnect;
+    heartbeatDeadline = setTimeout(disconnect, heartbeatIntervalMs + heartbeatTimeoutMs);
+    heartbeatDeadline.unref?.();
+    heartbeatTimer = setInterval(() => {
+      if (closed || disconnected || !authed || probeId) return;
+      clearTimeout(heartbeatDeadline);
+      probeId = `heartbeat:${++probeSequence}`;
+      heartbeatDeadline = setTimeout(disconnect, heartbeatTimeoutMs);
+      heartbeatDeadline.unref?.();
+      // Nostr REQ/EOSE works with the native WebSocket API, which has no ping().
+      // An impossible event ID avoids fetching channel history for a health check.
+      try { socket.send(JSON.stringify(['REQ', probeId, {ids: ['0'.repeat(64)], limit: 1}])); }
+      catch { disconnect(); }
+    }, heartbeatIntervalMs);
+    heartbeatTimer.unref?.();
+    socket.addEventListener("message", (ev) => { if (!disconnected && socket === ws) onMessage(ev.data); });
+    socket.addEventListener("close", disconnect);
+    socket.addEventListener("error", disconnect);
   };
   open();
-  return { me, drain: () => Promise.allSettled([...queues.values(), ...publications]), close() { closed = true; clearInterval(retryTimer); for (const timer of statusTimers) clearInterval(timer); statusTimers.clear(); try { ws?.close(); } catch { /* already closed */ } } };
+  return { me, drain: () => Promise.allSettled([...queues.values(), ...publications]), close() { closed = true; clearTimeout(reconnectTimer); clearInterval(heartbeatTimer); clearTimeout(heartbeatDeadline); clearInterval(retryTimer); for (const timer of statusTimers) clearInterval(timer); statusTimers.clear(); try { ws?.close(); } catch { /* already closed */ } } };
 }

@@ -95,7 +95,7 @@ export class RequestController {
   async postDurable(kind, id, actor, channel, text, replyTo, mention, participants) {
     if (!this.transport.prepare) return this.transport.post(actor, channel, text, replyTo, mention);
     const key = `${kind}:${id}`;
-    const event = this.transport.prepare(actor, channel, text, replyTo, mention);
+    const event = this.transport.prepare(actor, channel, text, replyTo, mention, {id, kind});
     this.change(s => { s.publications[key] ??= {key, kind, id, actor, channel, participants, event, status: 'running'}; });
     return this.publishRecord(key);
   }

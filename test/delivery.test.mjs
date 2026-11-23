@@ -112,3 +112,30 @@ test('two threads bound to one session serialize their turns',async()=>{
   const a=answer('a',{threadKey:'one'}),b=answer('b',{threadKey:'two'});await flush();assert.equal(started,1);
   busy=false;finish();await Promise.all([a,b]);assert.equal(started,2);assert.deepEqual(ids,['existing','existing']);
 });
+
+test('membership outage retries accepted work without resetting its queue deadline', async()=>{
+  const l=new DeliveryLedger(':memory:'); let checks=0;
+  const f=fixture(l,{retryIntervalMs:5,beforeAnswer:async()=>{if(++checks===1)throw Error('temporary outage');}});
+  try {
+    const e=event(); f.deliver(e); await f.client.drain();
+    assert.equal(l.get(e.id).state,'queued'); assert.equal(f.answers.length,0);
+    const queuedAt=l.get(e.id).queuedAt;
+    await new Promise(r=>setTimeout(r,25)); await f.client.drain();
+    assert.equal(f.answers.length,1); assert.equal(l.get(e.id).state,'published');
+    assert.equal(l.get(e.id).queuedAt,queuedAt);
+  } finally {await f.close();l.close();}
+});
+
+test('membership retries retain agent budget and expire without ever starting the model',async()=>{
+  const l=new DeliveryLedger(':memory:');let clock=1000000,checks=0;
+  const f=fixture(l,{allowAgents:[other],maxAgentReplies:1,retryIntervalMs:5,queueTimeoutMs:100,
+    now:()=>clock,beforeAnswer:async()=>{checks++;throw Error('unavailable');}});
+  try{
+    const e=event();f.deliver(e);await f.client.drain();
+    await new Promise(r=>setTimeout(r,20));await f.client.drain();
+    assert.ok(checks>1);assert.equal(l.get(e.id).reason,'visibility_check_retry');
+    clock+=101;await new Promise(r=>setTimeout(r,15));await f.client.drain();
+    assert.equal(l.get(e.id).reason,'queue_deadline_exceeded');assert.equal(f.answers.length,0);
+    const before=checks;await f.close();await new Promise(r=>setTimeout(r,15));assert.equal(checks,before);
+  }finally{await f.close();l.close();}
+});

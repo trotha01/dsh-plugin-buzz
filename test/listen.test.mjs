@@ -581,3 +581,28 @@ test('opted-in channel mentions answer trusted agents without mentioning back; D
     assert.deepEqual(calls,['question']);
   } finally { c.close(); }
 });
+
+test('silent socket reconnects even when close never emits; probe replies keep it alive', {timeout:5000}, async()=>{
+  for (const responsive of [false,true]) {
+    const sockets=[];
+    class WS {
+      constructor(){this.h={};sockets.push(this);queueMicrotask(()=>this.frame(['OK','auth',true,'']));}
+      addEventListener(k,f){this.h[k]=f;}
+      frame(m){this.h.message?.({data:JSON.stringify(m)});}
+      send(raw){const m=JSON.parse(raw);if(responsive && m[0]==='REQ' && m[1].startsWith('heartbeat:'))queueMicrotask(()=>this.frame(['EOSE',m[1]]));}
+      close(){} // blackholed TCP close handshake
+    }
+    const c=listen({name:'test',relayUrl:'https://example.invalid',secretHex:AGENT,allowFrom:[],
+      WebSocketImpl:WS,heartbeatIntervalMs:10,heartbeatTimeoutMs:10,log:()=>{},answer:async()=>'',send:async()=>{}});
+    try {
+      await new Promise(r=>setTimeout(r,responsive?70:1150));
+      assert.equal(sockets.length,responsive?1:2);
+      const count=sockets.length;
+      if (!responsive) {
+        sockets[0].h.close?.(); sockets[0].h.error?.();
+        sockets[0].frame(['CLOSED','old','stale']);
+      }
+      c.close();await new Promise(r=>setTimeout(r,40));assert.equal(sockets.length,count);
+    } finally {c.close();}
+  }
+});
