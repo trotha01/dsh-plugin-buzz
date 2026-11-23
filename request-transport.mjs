@@ -9,10 +9,11 @@ export function requestTransport(identities) {
     return withIdentity(identity, fn);
   };
   return {
-    prepare(actor, channel, text, replyTo, mention) {
+    prepare(actor, channel, text, replyTo, mention, delivery) {
       const identity = identities.get(actor);
       if (!identity) throw new Error('No configured runtime identity');
       const tags = [['h', channel]];
+      if (delivery) tags.push(['buzz-request', delivery.id, delivery.kind]);
       if (replyTo) tags.push(['e', replyTo, '', 'reply']);
       if (mention) tags.push(['p', mention]);
       return signEvent(readKey(identity.BUZZ_KEY_FILE), {kind: 9, tags, content: text});

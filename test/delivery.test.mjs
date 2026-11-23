@@ -112,3 +112,60 @@ test('two threads bound to one session serialize their turns',async()=>{
   const a=answer('a',{threadKey:'one'}),b=answer('b',{threadKey:'two'});await flush();assert.equal(started,1);
   busy=false;finish();await Promise.all([a,b]);assert.equal(started,2);assert.deepEqual(ids,['existing','existing']);
 });
+
+test('membership outage retries accepted work without resetting its queue deadline', async()=>{
+  const l=new DeliveryLedger(':memory:'); let checks=0;
+  const f=fixture(l,{retryIntervalMs:5,beforeAnswer:async()=>{if(++checks===1)throw Error('temporary outage');}});
+  try {
+    const e=event(); f.deliver(e); await f.client.drain();
+    assert.equal(l.get(e.id).state,'queued'); assert.equal(f.answers.length,0);
+    const queuedAt=l.get(e.id).queuedAt;
+    await new Promise(r=>setTimeout(r,25)); await f.client.drain();
+    assert.equal(f.answers.length,1); assert.equal(l.get(e.id).state,'published');
+    assert.equal(l.get(e.id).queuedAt,queuedAt);
+  } finally {await f.close();l.close();}
+});
+
+test('membership retries retain agent budget and expire without ever starting the model',async()=>{
+  const l=new DeliveryLedger(':memory:');let clock=1000000,checks=0;
+  const f=fixture(l,{allowAgents:[other],maxAgentReplies:1,retryIntervalMs:5,queueTimeoutMs:100,
+    now:()=>clock,beforeAnswer:async()=>{checks++;throw Error('unavailable');}});
+  try{
+    const e=event();f.deliver(e);await f.client.drain();
+    await new Promise(r=>setTimeout(r,20));await f.client.drain();
+    assert.ok(checks>1);assert.equal(l.get(e.id).reason,'visibility_check_retry');
+    clock+=101;await new Promise(r=>setTimeout(r,15));await f.client.drain();
+    assert.equal(l.get(e.id).reason,'queue_deadline_exceeded');assert.equal(f.answers.length,0);
+    const before=checks;await f.close();await new Promise(r=>setTimeout(r,15));assert.equal(checks,before);
+  }finally{await f.close();l.close();}
+});
+
+
+test('human membership retries and listener recovery attempt one receipt and clean status timers', async t => {
+  t.mock.timers.enable({apis:['setInterval']});
+  for (const failReceipt of [false, true]) {
+    const l = new DeliveryLedger(':memory:'), posts = [];
+    let checks = 0, permitted = false, clock = 1000000;
+    const options = {now:()=>clock, retryIntervalMs:30000, statusIntervalMs:60000,
+      beforeAnswer:async()=>{checks++;if(!permitted)throw Error('membership unavailable');},
+      send:async r=>{posts.push(r.text);if(failReceipt)throw Error('receipt unavailable');}};
+    let f = fixture(l, options);
+    try {
+      const e = event(); f.deliver(e); await f.client.drain();
+      for (let i=0;i<3;i++) {
+        clock+=30000;t.mock.timers.tick(30000);await f.client.drain();
+      }
+      assert.equal(checks,4); assert.equal(f.answers.length,0);
+      assert.equal(posts.length,1); assert.match(posts[0],/received your message/);
+      // A new listener must honor the persisted receipt attempt too.
+      await f.close();f=fixture(l,options);await f.client.drain();
+      assert.equal(checks,5);assert.equal(posts.length,1);
+      permitted=true;clock+=30000;t.mock.timers.tick(30000);await f.client.drain();
+      assert.equal(f.answers.length,1);assert.equal(l.get(e.id).state,'published');
+      assert.equal(posts.length,1);
+      clock+=120000;t.mock.timers.tick(120000);await f.client.drain();
+      assert.equal(posts.length,1,'no status timer survives completed attempts');
+      assert.equal(f.answers.length,1);
+    } finally {await f.close();l.close();}
+  }
+});
