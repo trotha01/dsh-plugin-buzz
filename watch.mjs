@@ -38,9 +38,8 @@ export function watch({ relayUrl, secretHex, filters = [], since, WebSocketImpl 
       probeId = undefined;
       try { socket.close(); } catch { /* already closed */ }
       log({ event: "buzz_watch_reconnect", in_ms: delay });
-      reconnectTimer = setTimeout(open, delay);
+      reconnectTimer = setTimeout(open, delay); // stays ref'd: the process must live until it reconnects
       delay = Math.min(delay * 2, 30_000);
-      reconnectTimer.unref?.();
     };
     const armInitialDeadline = () => {
       clearTimeout(heartbeatDeadline);
@@ -73,7 +72,7 @@ export function watch({ relayUrl, secretHex, filters = [], since, WebSocketImpl 
         socket.send(JSON.stringify(["AUTH", signEvent(secretHex, { kind: 22242, tags: [["relay", url], ["challenge", m[1]]] })]));
       } else if (m[0] === "OK" && authPending) {
         if (m[2] === true) { authPending = false; delay = 1000; sendReq(); }
-      } else if (m[0] === "CLOSED") {
+      } else if (m[0] === "CLOSED" && m[1] === subId) {
         const reason = String(m[2] || "");
         if (/auth/i.test(reason)) authPending = true;
         else disconnect();
