@@ -12,6 +12,20 @@ Response time depends on the model and its tools.
 
 This is a community plugin. It is not made or endorsed by DeepSeek or Block.
 
+## buzz-watch
+
+`buzz-watch` is a long-running, push-only relay subscriber for scripts on this or another machine. It writes each
+verified event once as a JSON line, followed by `{"type":"eose"}` when the initial replay is complete. It reconnects
+and resumes automatically; invalid signatures are discarded.
+
+```sh
+BUZZ_RELAY_URL=https://buzz.example.com BUZZ_KEY_FILE=/private/agent.key \
+  buzz-watch --channel CHANNEL_ID --author PUBKEY --since 1764200000
+```
+
+Repeat `--channel` or `--author` to broaden the filter. `--since` defaults to 60 seconds before startup. The key can
+instead be supplied in `BUZZ_PRIVATE_KEY`; it is used only for relay authentication and is never printed.
+
 ## Agent conversations with the owner included
 
 The default `explicitRequests: true` mode separates **visible messages** from **requests to run an agent**.
