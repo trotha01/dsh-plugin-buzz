@@ -57,3 +57,17 @@ test("watch reconnects and resumes from last seen minus 60", async () => {
   assert.equal(resumed[2].since, 1040);
   w.close();
 });
+
+test("CLOSED for a heartbeat probe does not drop the subscription", async () => {
+  const { watch } = await import("../watch.mjs");
+  const sockets = [];
+  class FakeWS { constructor(u) { this.l = {}; this.sent = []; sockets.push(this); queueMicrotask(() => this.emit("open")); }
+    addEventListener(t, f) { (this.l[t] ||= []).push(f); } emit(t, e = {}) { for (const f of this.l[t] || []) f(e); }
+    send(d) { this.sent.push(JSON.parse(d)); } close() {} }
+  const w = watch({ relayUrl: "http://r", secretHex: "1".repeat(64), filters: [{ kinds: [9] }], WebSocketImpl: FakeWS, out: { write() {} } });
+  await new Promise(r => setTimeout(r, 5));
+  sockets[0].emit("message", { data: JSON.stringify(["CLOSED", "buzz-watch-heartbeat:9", ""]) });
+  await new Promise(r => setTimeout(r, 1100));
+  assert.equal(sockets.length, 1);
+  w.close();
+});
